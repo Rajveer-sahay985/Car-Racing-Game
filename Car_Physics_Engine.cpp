@@ -187,9 +187,41 @@ int main()
     btRigidBody* ground = MakeRigidBody(0.0f, groundTrans, groundShape);
     ground->setFriction(0.85f);
 
-    // ---- Chassis box ----
-    // Half-extents: match the car visually (width 0.85, height 0.35, length 2.1)
-    btCollisionShape* chassisShape = new btBoxShape(btVector3(0.85f, 0.35f, 2.1f));
+    // ---- Chassis: compound shape = body box + 4 wheel cylinder approximations ----
+    //
+    //  btRaycastVehicle suspension raycasts automatically EXCLUDE the chassis
+    //  rigid body, so adding wheel cylinders to it does NOT interfere with
+    //  suspension. The cylinders give the wheels real collision against walls.
+    //
+    //  At rest the wheel centres are at local y ≈ -(suspLen + wheelRadius)
+    //               = -(0.45 + 0.333) = -0.783  below the chassis centre.
+    //  We place cylinders at local y = -0.68 and radius 0.30 (slightly inside
+    //  the tyre) so they float ~3cm off the ground at rest — they don't clash
+    //  with the ground plane but DO hit obstacle sides.
+    //
+    const float HUB_Y      = -0.68f;   // local y for wheel hub cylinders
+    const float CYL_RADIUS = 0.30f;    // slightly less than wheelRadius (0.333)
+    const float CYL_HWIDTH = 0.18f;    // half tyre width on the axle axis
+
+    btCompoundShape* chassisShape = new btCompoundShape();
+
+    // Child 1: main body box
+    btBoxShape* bodyBox = new btBoxShape(btVector3(0.85f, 0.35f, 2.1f));
+    btTransform bodyLocal; bodyLocal.setIdentity();
+    chassisShape->addChildShape(bodyLocal, bodyBox);
+
+    // Children 2-5: wheel hub cylinders (btCylinderShapeX rotates around X)
+    // half-extents: (half-axle-width, radius, radius)
+    btCylinderShapeX* wheelCyl = new btCylinderShapeX(
+        btVector3(CYL_HWIDTH, CYL_RADIUS, CYL_RADIUS));
+
+    const float HUB_X[4] = { -0.85f,  0.85f, -0.85f,  0.85f };
+    const float HUB_Z[4] = {  1.55f,  1.55f, -1.55f, -1.55f };
+    for (int i = 0; i < 4; i++) {
+        btTransform cylLocal; cylLocal.setIdentity();
+        cylLocal.setOrigin(btVector3(HUB_X[i], HUB_Y, HUB_Z[i]));
+        chassisShape->addChildShape(cylLocal, wheelCyl);
+    }
 
     // Spawn the car chassis so its bottom face sits at y=0
     // Bottom of box = origin.y - halfExtent.y = 0.35  → origin.y = 0.35
@@ -201,6 +233,7 @@ int main()
     btRigidBody* chassis = MakeRigidBody(900.0f, startTrans, chassisShape);
     chassis->setActivationState(DISABLE_DEACTIVATION);
     chassis->setDamping(0.05f, 0.7f);   // (linear, angular)
+
 
     // ---- btRaycastVehicle ----
     btVehicleRaycaster* raycaster = new btDefaultVehicleRaycaster(gWorld);
@@ -495,7 +528,9 @@ int main()
         gWorld->removeCollisionObject(obj);
         delete obj;
     }
-    delete chassisShape;
+    delete chassisShape;   // compound
+    delete bodyBox;        // child of compound (compound doesn't own children)
+    delete wheelCyl;       // shared by all 4 wheel cylinders
     delete groundShape;
     delete gWorld;
     delete gSolver;
