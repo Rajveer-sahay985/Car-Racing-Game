@@ -44,6 +44,46 @@ static btRigidBody* MakeRigidBody(float mass,
 }
 
 // =============================================================================
+//  OBSTACLE — pairs a visible raylib Model with a Bullet static collider
+// =============================================================================
+struct Obstacle {
+    Model         model;
+    btRigidBody*  body        = nullptr;
+    btBoxShape*   shape       = nullptr;
+    Vector3       worldPos    = {0,0,0};  // world centre of the collider
+    float         visualScale = 1.0f;
+    Color         tint        = WHITE;
+};
+
+// Build a static box obstacle from an OBJ file.
+// halfExtents: the Bullet box half-extents in world units.
+// worldPos:    centre of the box in world space (y should be half-height to sit on ground).
+static Obstacle MakeObstacle(const char* objFile, Shader sh,
+                              btVector3 halfExtents, Vector3 worldPos,
+                              float visualScale = 1.0f, Color tint = WHITE)
+{
+    Obstacle obs;
+    obs.model       = LoadModel(objFile);
+    obs.worldPos    = worldPos;
+    obs.visualScale = visualScale;
+    obs.tint        = tint;
+
+    for (int m = 0; m < obs.model.materialCount; m++)
+        obs.model.materials[m].shader = sh;
+
+    obs.shape = new btBoxShape(halfExtents);
+
+    btTransform t;
+    t.setIdentity();
+    t.setOrigin(btVector3(worldPos.x, worldPos.y, worldPos.z));
+
+    obs.body = MakeRigidBody(0.0f, t, obs.shape);  // mass=0 → static
+    obs.body->setFriction(0.85f);
+    obs.body->setRestitution(0.3f);
+    return obs;
+}
+
+// =============================================================================
 //  MAIN
 // =============================================================================
 int main()
@@ -112,6 +152,7 @@ int main()
     Model carModel = LoadModel("car.obj");
     for (int m = 0; m < carModel.materialCount; m++)
         carModel.materials[m].shader = celShader;
+
 
     // -------------------------------------------------------------------------
     //  CAR DIMENSIONS  (unchanged from Step 0)
@@ -202,6 +243,45 @@ int main()
         if (!isFront[i])
             wi.m_frictionSlip  = 2.8f;    // rear gets a bit more grip (RWD)
     }
+
+    // =========================================================================
+    //  OBSTACLES — exactly 3, one per exported OBJ, at their Blender positions
+    // =========================================================================
+    //
+    //  We compute the Bullet body centre and half-extents directly from the
+    //  OBJ vertex min/max bounds so physics and visuals stay in sync.
+    //  DrawModel is called with position (0,0,0) so the baked Blender vertex
+    //  coordinates are used exactly as exported — no extra offset applied.
+    //
+    //  bump1 vertices:  x [-1.715 , 1.715]  y [0.000 ,  9.630]  z [13.872, 17.302]
+    //    → centre ( 0.000,  4.815, 15.587 )   half (1.715, 4.815, 1.715)
+    //
+    //  bump2 vertices:  x [ 0.835 , 1.243]  y [-0.313,  0.096]  z [-7.458, -5.458]
+    //    → centre ( 1.039, -0.108, -6.458 )   half (0.204, 0.204, 1.000)
+    //
+    //  bump3 vertices:  x [-7.429 ,-7.021]  y [-0.278,  0.130]  z [-10.358, -8.358]
+    //    → centre (-7.225, -0.074, -9.358 )   half (0.204, 0.204, 1.000)
+    //
+    static const int NUM_OBS = 3;
+    Obstacle gObs[NUM_OBS];
+
+    // bump1 — tall block
+    gObs[0] = MakeObstacle("bump1.obj", celShader,
+        btVector3(1.715f, 4.815f, 1.715f),
+        {0.0f, 4.815f, 15.587f},
+        1.0f, {220, 80, 40, 255});
+
+    // bump2 — small speed strip
+    gObs[1] = MakeObstacle("bump2.obj", celShader,
+        btVector3(0.204f, 0.204f, 1.0f),
+        {1.039f, -0.108f, -6.458f},
+        1.0f, {255, 200, 50, 255});
+
+    // bump3 — small speed strip
+    gObs[2] = MakeObstacle("bump3.obj", celShader,
+        btVector3(0.204f, 0.204f, 1.0f),
+        {-7.225f, -0.074f, -9.358f},
+        1.0f, {80, 180, 255, 255});
 
     // =========================================================================
     //  PHYSICS INPUT STATE  (replaces the old physics state vars)
@@ -373,6 +453,11 @@ int main()
                 carModel.transform = chassisMat;
                 DrawModel(carModel, {0,0,0}, 1.0f, WHITE);
 
+                // --- Obstacles: render at (0,0,0) — vertex positions already
+                //     encode the Blender world transform, no extra offset needed ---
+                for (int i = 0; i < NUM_OBS; i++)
+                    DrawModel(gObs[i].model, {0,0,0}, 1.0f, gObs[i].tint);
+
             EndMode3D();
 
             // --- HUD ---
@@ -393,6 +478,15 @@ int main()
     gWorld->removeVehicle(vehicle);
     delete vehicle;
     delete raycaster;
+
+    // Cleanup obstacles
+    for (int i = 0; i < NUM_OBS; i++) {
+        gWorld->removeRigidBody(gObs[i].body);
+        if (gObs[i].body->getMotionState()) delete gObs[i].body->getMotionState();
+        delete gObs[i].body;
+        delete gObs[i].shape;
+        UnloadModel(gObs[i].model);
+    }
 
     for (int i = gWorld->getNumCollisionObjects() - 1; i >= 0; i--) {
         btCollisionObject* obj = gWorld->getCollisionObjectArray()[i];
