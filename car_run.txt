@@ -1,9 +1,16 @@
-clang++ Car_Physics_Engine.cpp -std=c++11 \
--I/opt/homebrew/include \
--L/opt/homebrew/lib \
--lraylib \
--framework OpenGL \
--framework Cocoa \
--framework IOKit \
--framework CoreVideo \
--o car_main && ./car_main
+# Step 0 — base (no Bullet)
+clang++ Car_Physics_Engine.cpp -std=c++17 \
+  -I/opt/homebrew/include \
+  -L/opt/homebrew/lib \
+  -lraylib \
+  -framework OpenGL -framework Cocoa -framework IOKit -framework CoreVideo \
+  -O2 -o car_main && ./car_main
+
+# Step 1+ — with Bullet Physics
+# clang++ Car_Physics_Engine.cpp -std=c++17 \
+#   -I/opt/homebrew/include \
+#   -I/opt/homebrew/include/bullet \
+#   -L/opt/homebrew/lib \
+#   -lraylib -lBulletDynamics -lBulletCollision -lLinearMath \
+#   -framework OpenGL -framework Cocoa -framework IOKit -framework CoreVideo \
+#   -O2 -o car_main && ./car_main

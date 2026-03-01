@@ -1,11 +1,23 @@
+// =============================================================================
+//  Vortex Racing Engine — STEP 0: Working base (bicycle physics + textures)
+//  Build:
+//    clang++ Car_Physics_Engine.cpp -std=c++17 \
+//      -I/opt/homebrew/include -L/opt/homebrew/lib \
+//      -lraylib -framework OpenGL -framework Cocoa -framework IOKit -framework CoreVideo \
+//      -O2 -o car_main && ./car_main
+// =============================================================================
 #include "raylib.h"
 #include "raymath.h"
 #include <cmath>
 
-int main(){
-    InitWindow(1280, 720, "Car Physics Engine");
+int main()
+{
+    InitWindow(1280, 720, "Vortex Racing — Step 0: Base");
     SetTargetFPS(60);
-    // --- Cel-shading (toon) shader ---
+
+    // -------------------------------------------------------------------------
+    //  CEL SHADER — textured toon shading
+    // -------------------------------------------------------------------------
     const char *celVS =
         "#version 410 core\n"
         "in vec3 vertexPosition;\n"
@@ -45,66 +57,79 @@ int main(){
 
     Shader celShader = LoadShaderFromMemory(celVS, celFS);
 
-    // --- Load actual wheel .obj models ---
-    float wheelRadius = 0.333f;   // from OBJ: Y size is 0.666, so radius = 0.333
-    Model wheelModels[4] = {
-        LoadModel("wheel_fr.obj"),   // 0 = Front-Left
-        LoadModel("wheel_fl.obj"),   // 1 = Front-Right
-        LoadModel("wheel_rr.obj"),   // 2 = Rear-Left
-        LoadModel("wheel_rl.obj"),   // 3 = Rear-Right
-    };
+    // -------------------------------------------------------------------------
+    //  MODELS
+    // -------------------------------------------------------------------------
+    float wheelRadius = 0.333f;
 
-    // Apply cel shader to every material of every wheel
+    // 0=FL, 1=FR, 2=RL, 3=RR
+    Model wheelModels[4] = {
+        LoadModel("wheel_fr.obj"),
+        LoadModel("wheel_fl.obj"),
+        LoadModel("wheel_rr.obj"),
+        LoadModel("wheel_rl.obj"),
+    };
     for (int i = 0; i < 4; i++)
         for (int m = 0; m < wheelModels[i].materialCount; m++)
             wheelModels[i].materials[m].shader = celShader;
 
-    // --- Load car chassis .obj model ---
     Model carModel = LoadModel("car.obj");
     for (int m = 0; m < carModel.materialCount; m++)
         carModel.materials[m].shader = celShader;
 
-    // --- Car dimensions ---
+    // -------------------------------------------------------------------------
+    //  CAR DIMENSIONS
+    // -------------------------------------------------------------------------
     float wheelBase  = 2.5f;
     float trackWidth = 1.6f;
+    float frontZOffset = 0.35f;
+    float rearZOffset  = 0.0f;
 
-    // Fine-tune wheel arch alignment (positive = further forward for front, further back for rear)
-    float frontZOffset = 0.35f;   // push front wheels forward into their arch
-    float rearZOffset  = 0.0f;   // push rear wheels back into their arch
-
-    // Wheel local positions: FL, FR, RL, RR
+    // Wheel positions in car-local space: FL(0) FR(1) RL(2) RR(3)
     Vector3 wheelLocal[4] = {
-        {-trackWidth/2, wheelRadius,  wheelBase/2 + frontZOffset},   // FL
-        { trackWidth/2, wheelRadius,  wheelBase/2 + frontZOffset},   // FR
-        {-trackWidth/2, wheelRadius, -wheelBase/2 - rearZOffset},    // RL
-        { trackWidth/2, wheelRadius, -wheelBase/2 - rearZOffset},    // RR
+        { -trackWidth/2, wheelRadius,  wheelBase/2 + frontZOffset },  // FL
+        {  trackWidth/2, wheelRadius,  wheelBase/2 + frontZOffset },  // FR
+        { -trackWidth/2, wheelRadius, -wheelBase/2 - rearZOffset  },  // RL
+        {  trackWidth/2, wheelRadius, -wheelBase/2 - rearZOffset  },  // RR
     };
 
-    // --- Physics state ---
-    Vector3 carPos = {0, 0, 0};
-    float heading    = 0.0f;
-    float speed      = 0.0f;
-    float steerAngle = 0.0f;
-    float wheelSpin  = 0.0f;
+    // -------------------------------------------------------------------------
+    //  PHYSICS STATE  (bicycle model)
+    // -------------------------------------------------------------------------
+    Vector3 carPos    = { 0, 0, 0 };
+    float   heading   = 0.0f;     // yaw in radians
+    float   speed     = 0.0f;     // m/s, positive = forward
+    float   steerAngle= 0.0f;     // radians
+    float   wheelSpin = 0.0f;     // accumulated roll angle
 
     // --- Tuning ---
-    float engineForce    = 10.0f;
-    float brakeForce     = 15.0f;
-    float maxSpeed       = 25.0f;
-    float maxReverse     = 10.0f;
-    float friction       = 2.0f;
-    float maxSteer       = 35.0f * DEG2RAD;
-    float steerSpeed     = 2.5f;
-    float steerReturn    = 5.0f;
+    float engineForce = 10.0f;
+    float brakeForce  = 15.0f;
+    float maxSpeed    = 25.0f;
+    float maxReverse  = 10.0f;
+    float friction    = 2.0f;
+    float maxSteer    = 35.0f * DEG2RAD;
+    float steerSpeed  = 2.5f;
+    float steerReturn = 5.0f;
 
-    // --- Orbital camera ---
-    float camYaw = 0.0f, camPitch = 25.0f;
-    float camDist = 12.0f, camDistTgt = 12.0f;
+    // -------------------------------------------------------------------------
+    //  CAMERA  (basic orbital)
+    // -------------------------------------------------------------------------
+    float camYaw   = 0.0f;
+    float camPitch = 25.0f;
+    float camDist  = 12.0f;
+    float camDistTgt = 12.0f;
 
-    while (!WindowShouldClose()) {
+    // =========================================================================
+    //  GAME LOOP
+    // =========================================================================
+    while (!WindowShouldClose())
+    {
         float dt = GetFrameTime();
 
-        // ===== INPUT =====
+        // =====================================================================
+        //  INPUT + BICYCLE PHYSICS
+        // =====================================================================
         if (IsKeyDown(KEY_W))      speed += engineForce * dt;
         else if (IsKeyDown(KEY_S)) speed -= (speed > 0.5f ? brakeForce : engineForce * 0.5f) * dt;
         else {
@@ -123,23 +148,21 @@ int main(){
         if (steerAngle >  maxSteer) steerAngle =  maxSteer;
         if (steerAngle < -maxSteer) steerAngle = -maxSteer;
 
-        // Speed-dependent steering (harder to turn at high speed)
-        float sFactor = 1.0f - 0.5f * (fabsf(speed) / maxSpeed);
+        // Speed-dependent steering
+        float sFactor  = 1.0f - 0.5f * (fabsf(speed) / maxSpeed);
         float effSteer = steerAngle * sFactor;
 
-        // ===== BICYCLE MODEL PHYSICS =====
+        // Bicycle model
         if (fabsf(speed) > 0.01f)
             heading += (speed * tanf(effSteer) / wheelBase) * dt;
 
         carPos.x += speed * sinf(heading) * dt;
         carPos.z += speed * cosf(heading) * dt;
-        // 👇 WHEEL ROLL CALCULATION — this accumulates the rolling angle.
-        // angular velocity = speed / radius  (like a real tire: faster you go, faster it spins)
-        // Positive speed (W) → wheelSpin increases → wheels roll forward (clockwise from right side)
-        // Negative speed (S/reverse) → wheelSpin decreases → wheels roll backward (counter-clockwise)
         wheelSpin += (speed / wheelRadius) * dt;
 
-        // ===== CAMERA =====
+        // =====================================================================
+        //  ORBITAL CAMERA
+        // =====================================================================
         if (IsMouseButtonDown(MOUSE_BUTTON_LEFT) || IsMouseButtonDown(MOUSE_BUTTON_RIGHT)) {
             Vector2 md = GetMouseDelta();
             camYaw   -= md.x * 0.3f;
@@ -152,7 +175,7 @@ int main(){
         if (camDistTgt > 40) camDistTgt = 40;
         camDist += (camDistTgt - camDist) * 8.0f * dt;
 
-        Vector3 camTgt = {carPos.x, 0.5f, carPos.z};
+        Vector3 camTgt = { carPos.x, 0.5f, carPos.z };
         float yr = camYaw * DEG2RAD, pr = camPitch * DEG2RAD;
         Camera3D camera = {0};
         camera.position = {
@@ -160,80 +183,61 @@ int main(){
             camTgt.y + camDist * sinf(pr),
             camTgt.z + camDist * cosf(pr) * cosf(yr)
         };
-        camera.target = camTgt;
-        camera.up = {0, 1, 0};
-        camera.fovy = 45.0f;
+        camera.target     = camTgt;
+        camera.up         = { 0, 1, 0 };
+        camera.fovy       = 45.0f;
         camera.projection = CAMERA_PERSPECTIVE;
 
-        // ===== DRAW =====
+        // =====================================================================
+        //  DRAW
+        // =====================================================================
         BeginDrawing();
             ClearBackground(BLACK);
 
             // Sky gradient
             int hH = GetScreenHeight() / 2;
-            DrawRectangleGradientV(0, 0,  GetScreenWidth(), hH, (Color){25,25,112,255}, (Color){135,206,235,255});
-            DrawRectangleGradientV(0, hH, GetScreenWidth(), hH, (Color){135,206,235,255}, (Color){255,200,150,255});
+            DrawRectangleGradientV(0,  0, GetScreenWidth(), hH, {25,25,112,255}, {135,206,235,255});
+            DrawRectangleGradientV(0, hH, GetScreenWidth(), hH, {135,206,235,255}, {255,200,150,255});
 
             BeginMode3D(camera);
-                DrawPlane({0,0,0}, {100,100}, (Color){50,50,50,255});
+                DrawPlane({0,0,0}, {200,200}, {50,50,50,255});
                 DrawGrid(100, 1.0f);
 
-                // Compute world wheel positions for frame lines
-                Matrix carMat = MatrixMultiply(MatrixRotateY(heading), MatrixTranslate(carPos.x, 0, carPos.z));
-                Vector3 wWorld[4];
+                Matrix carMat = MatrixMultiply(
+                    MatrixRotateY(heading),
+                    MatrixTranslate(carPos.x, 0, carPos.z)
+                );
 
-                // Draw 4 wheels (using actual .obj models)
+                // --- Wheels ---
                 for (int i = 0; i < 4; i++) {
                     bool front = (i < 2);
-
-                    // --- VISUAL ORIENTATION AND PLACEMENT ---
-                    
-                    // 1. ROTATE AROUND AXLE (Spinning)
-                    // This rotates the wheel around its own X-axis based on the distance traveled.
                     Matrix m = MatrixRotateX(wheelSpin);
-
-                    // 2. STEER (Front Wheels Only)
-                    // For the front two wheels (i=0 and i=1), we rotate them around the Y-axis
-                    // so they point in the direction of the steering.
                     if (front) m = MatrixMultiply(m, MatrixRotateY(steerAngle));
-
-                    // 3. ATTACH TO CHASSIS (Local Offset)
-                    // We move the wheel from the origin to its specific corner on the vehicle.
                     m = MatrixMultiply(m, MatrixTranslate(wheelLocal[i].x, wheelLocal[i].y, wheelLocal[i].z));
-
-                    // 4. ORIENT WITH VEHICLE (Heading and World Position)
-                    // Finally, we rotate the whole wheel setup based on the car's current heading
-                    // and move it to the car's current position in the world.
                     m = MatrixMultiply(m, carMat);
-
                     wheelModels[i].transform = m;
                     DrawModel(wheelModels[i], {0,0,0}, 1.0f, WHITE);
-                    //DrawModelWires(wheelModels[i], {0,0,0}, 1.0f, BLACK);
-
-                    wWorld[i] = Vector3Transform(wheelLocal[i], carMat);
                 }
 
-                // Draw car chassis — shifted backward in local space to align rear wheel arches
-                // Negative Z = move chassis toward the rear relative to the car's heading
-                float chassisZOffset = -0.1f;
-                Matrix chassisMat = MatrixMultiply(MatrixTranslate(0.0f, 0.0f, chassisZOffset), carMat);
+                // --- Chassis ---
+                Matrix chassisMat = MatrixMultiply(MatrixTranslate(0, 0, -0.1f), carMat);
                 carModel.transform = chassisMat;
                 DrawModel(carModel, {0,0,0}, 1.0f, WHITE);
-                //DrawModelWires(carModel, {0,0,0}, 1.0f, BLACK);
+
             EndMode3D();
 
-            // HUD
-            DrawText("Car Physics Engine", 10, 10, 22, WHITE);
-            DrawText(TextFormat("Speed: %.1f m/s", speed), 10, 40, 18, GREEN);
-            DrawText(TextFormat("Steer: %.1f deg", steerAngle * RAD2DEG), 10, 62, 18, YELLOW);
+            // --- HUD ---
+            DrawText("Step 0: Base (Bicycle Physics + Textures)", 10, 10, 18, WHITE);
+            DrawText(TextFormat("Speed: %.1f m/s", speed),           10, 38, 16, GREEN);
+            DrawText(TextFormat("Steer: %.1f deg", steerAngle*RAD2DEG),10,58,16, YELLOW);
             int y = GetScreenHeight() - 90;
-            DrawText("W / S  :  Throttle / Brake-Reverse", 10, y,    16, WHITE);
-            DrawText("A / D  :  Steer Left / Right",       10, y+20, 16, WHITE);
-            DrawText("Mouse drag : Orbit camera",          10, y+40, 16, WHITE);
-            DrawText("Scroll     : Zoom",                  10, y+60, 16, WHITE);
+            DrawText("W/S  : Throttle / Brake",  10, y,    15, {180,180,180,255});
+            DrawText("A/D  : Steer",              10, y+18, 15, {180,180,180,255});
+            DrawText("Mouse: Orbit camera",        10, y+36, 15, {180,180,180,255});
         EndDrawing();
     }
 
+    // Cleanup
     for (int i = 0; i < 4; i++) UnloadModel(wheelModels[i]);
     UnloadModel(carModel);
     UnloadShader(celShader);
