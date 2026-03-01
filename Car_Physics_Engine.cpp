@@ -120,7 +120,7 @@ int main()
     const float P_WHEEL_RADIUS    = 0.333f;  // visual + physics wheel radius (m)
 
     // --- Chassis ---
-    const float P_CHASSIS_MASS    = 900.0f;  // kg (lower = lighter, easier to drift)
+    const float P_CHASSIS_MASS    = 700.0f;  // kg (lower = lighter, easier to drift)
     const float P_LINEAR_DAMP     = 0.15f;   // air/roll resistance (0=float, 0.3=sluggish)
     const float P_ANGULAR_DAMP    = 0.75f;   // yaw drag
     const float P_ROLL_INFLUENCE  = 0.15f;   // anti-roll (0=tippy, 0.5=planted)
@@ -132,13 +132,13 @@ int main()
     // --- Drift ---
     const float P_HB_FRICTION     = 0.85f;   // rear grip during handbrake
                                               //  lower = easier to slide (try 0.6-1.0)
-    const float P_DRIFT_SUSTAIN   = 1.4f;    // how fast grip drops while sliding
+    const float P_DRIFT_SUSTAIN   = 2.4f;    // how fast grip drops while sliding
                                               //  higher = slide sustains longer
     const float P_DRIFT_MIN_FRIC  = 1.2f;    // minimum rear grip during sustained slide
-    const float P_MAX_YAW_RATE    = 2.0f;    // rad/s cap — MAIN anti-spinout dial
+    const float P_MAX_YAW_RATE    = 10.0f;    // rad/s cap — MAIN anti-spinout dial
                                               //  lower (1.5) = tighter control
                                               //  higher (3.0) = wilder spins
-    const float P_COUNTERSTEER    = 600.0f;  // countersteer assist strength
+    const float P_COUNTERSTEER    = 6000.0f;  // countersteer assist strength
 
     // --- Body Feel (visual dynamics) ---
     const float P_BODY_ROLL       = 0.06f;   // lean amount in corners (rad per m/s lateral)
