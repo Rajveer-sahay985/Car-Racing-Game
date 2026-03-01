@@ -374,9 +374,15 @@ int main()
         vehicle->setBrake(brakeForce, 3);
 
         // =====================================================================
-        //  STEP 4: DRIFT / TRACTION SYSTEM
-        //  Space = handbrake: cuts rear grip → initiates drift.
-        //  Lateral velocity ratio is used to detect + sustain the slide.
+        //  STEP 4: NFS-STYLE DRIFT / TRACTION
+        //
+        //  NFS drift secret: DON'T lock the rear wheels.
+        //  Just reduce rear friction so wheels spin freely with low grip.
+        //  Engine force through the spinning rear creates POWER OVERSTEER.
+        //  Throttle + steer + drift angle find a natural equilibrium — fun!
+        //
+        //  Old (bad):  friction=0.4 + MAX_BRAKE*4 → instant spinout
+        //  New (good): friction=0.85 + NO rear lock → controllable slide
         // =====================================================================
 
         // --- Read chassis velocity in local car space ---
@@ -385,45 +391,75 @@ int main()
         btVector3 vel        = chassis->getLinearVelocity();
         btVector3 fwdWorld   = driftTrans.getBasis().getColumn(2);  // car's +Z
         btVector3 rightWorld = driftTrans.getBasis().getColumn(0);  // car's +X
-        float     fwdSpd     = vel.dot(fwdWorld);
-        float     latSpd     = vel.dot(rightWorld); // positive = sliding right
+        float     latSpd     = vel.dot(rightWorld);  // positive = sliding right
         float     totalSpd   = btSqrt(vel.x()*vel.x() + vel.z()*vel.z());
 
         // Drift ratio: 0 = tracking straight, 1 = fully sideways
         float driftRatio = (totalSpd > 1.0f) ? fabsf(latSpd) / totalSpd : 0.0f;
-        bool  isDrifting = driftRatio > 0.20f;
+        bool  isDrifting = driftRatio > 0.18f;
 
         // --- Handbrake (Space) ---
         bool handbrake = IsKeyDown(KEY_SPACE);
 
-        // --- Dynamic rear friction ---
-        //  Normal = 2.8 (grippy RWD)
-        //  Handbrake = 0.4 (almost no rear grip → slides)
-        //  While drifting → friction reduced proportionally so slide sustains
+        // --- Dynamic rear friction (NFS sweet spot) ---
+        //  Normal grip  = 2.8
+        //  Handbrake    = 0.85  ← high enough to steer, low enough to slide
+        //  Sustain slide = 1.4-2.0 so the drift keeps going after handbrake release
         float targetRearFriction;
         if (handbrake) {
-            targetRearFriction = 0.4f;                        // full handbrake
+            targetRearFriction = 0.85f;   // controlled slide — NOT a full lock
         } else if (isDrifting) {
-            // Partial grip loss while sliding: lerp 1.8→2.8 based on drift depth
-            targetRearFriction = 2.8f - driftRatio * 1.0f;   // max reduction: -1.0
-            if (targetRearFriction < 1.4f) targetRearFriction = 1.4f;
+            // Slide self-sustains: friction drops with drift depth
+            targetRearFriction = 2.8f - driftRatio * 1.4f;
+            if (targetRearFriction < 1.2f) targetRearFriction = 1.2f;
         } else {
-            targetRearFriction = 2.8f;                        // full grip
+            targetRearFriction = 2.8f;    // full RWD grip
         }
 
-        // Smoothly lerp rear friction (prevents snap)
         static float rearFriction = 2.8f;
-        float frictionRate = handbrake ? 20.0f : 8.0f;       // fast lock, slow release
+        float frictionRate = handbrake ? 18.0f : 6.0f;  // fast in, slow out
         rearFriction += (targetRearFriction - rearFriction) * frictionRate * dt;
-
         vehicle->getWheelInfo(2).m_frictionSlip = rearFriction;
         vehicle->getWheelInfo(3).m_frictionSlip = rearFriction;
 
-        // Handbrake: heavy rear brake (lock rear wheels to break traction)
+        // Handbrake: light FRONT brake only (weight transfer feel).
+        // Rear wheels are NOT braked — they spin freely with low friction.
+        // Engine force through spinning rear = power oversteer, not spinout.
         if (handbrake) {
-            vehicle->setBrake(MAX_BRAKE * 4.0f, 2);
-            vehicle->setBrake(MAX_BRAKE * 4.0f, 3);
+            vehicle->setBrake(MAX_BRAKE * 0.6f, 0);   // front-left light brake
+            vehicle->setBrake(MAX_BRAKE * 0.6f, 1);   // front-right light brake
+            // rear wheels: no extra brake (already set to brakeForce above)
         }
+
+        // --- Yaw rate cap: prevents the "instant 180°" spinout ---
+        // Cap angular velocity around Y to ~115°/sec (2.0 rad/s).
+        // This is the invisible hand that makes NFS feel controllable.
+        {
+            btVector3 angVel = chassis->getAngularVelocity();
+            float yawRate = angVel.y();
+            const float MAX_YAW = 2.0f;   // rad/s cap
+            if (fabsf(yawRate) > MAX_YAW) {
+                float clamped = MAX_YAW * (yawRate > 0 ? 1.0f : -1.0f);
+                chassis->setAngularVelocity(
+                    btVector3(angVel.x(), clamped, angVel.z()));
+            }
+        }
+
+        // --- Countersteer assist ---
+        // When drifting AND holding opposite steer, apply a subtle corrective
+        // torque to help the player catch the slide (NFS "drift assist").
+        if (isDrifting && fabsf(steerSmoothed) > 0.05f) {
+            // latSpd > 0 = sliding right; steerSmoothed > 0 = turning left
+            // Countersteering = these have the SAME sign
+            float steerDotSlide = steerSmoothed * latSpd;
+            if (steerDotSlide > 0.0f) {  // countersteering detected
+                float assistStrength = driftRatio * 800.0f * steerDotSlide;
+                // Torque that pushes yaw back toward straight
+                chassis->applyTorque(
+                    btVector3(0, -latSpd * driftRatio * 600.0f, 0));
+            }
+        }
+
 
         // =====================================================================
         //  R KEY: RESET CAR UPRIGHT
