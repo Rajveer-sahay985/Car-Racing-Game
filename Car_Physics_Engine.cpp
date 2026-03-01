@@ -232,7 +232,7 @@ int main()
 
     btRigidBody* chassis = MakeRigidBody(900.0f, startTrans, chassisShape);
     chassis->setActivationState(DISABLE_DEACTIVATION);
-    chassis->setDamping(0.05f, 0.7f);   // (linear, angular)
+    chassis->setDamping(0.15f, 0.75f);   // linear=0.15 (realistic coast), angular=0.75
 
 
     // ---- btRaycastVehicle ----
@@ -272,60 +272,45 @@ int main()
         vehicle->addWheel(connPts[i], wheelDir, axleDir,
                           suspLen, wheelRadius, tuning, isFront[i]);
         btWheelInfo& wi        = vehicle->getWheelInfo(i);
-        wi.m_rollInfluence     = 0.08f;   // low = less body roll = planted feel
+        wi.m_rollInfluence     = 0.15f;   // anti-roll resistance (higher = harder to flip)
         if (!isFront[i])
             wi.m_frictionSlip  = 2.8f;    // rear gets a bit more grip (RWD)
     }
 
     // =========================================================================
-    //  OBSTACLES — exactly 3, one per exported OBJ, at their Blender positions
+    //  OBSTACLES — commented out for car physics testing
+    //  Uncomment when ready to add collision testing back.
     // =========================================================================
-    //
-    //  We compute the Bullet body centre and half-extents directly from the
-    //  OBJ vertex min/max bounds so physics and visuals stay in sync.
-    //  DrawModel is called with position (0,0,0) so the baked Blender vertex
-    //  coordinates are used exactly as exported — no extra offset applied.
-    //
-    //  bump1 vertices:  x [-1.715 , 1.715]  y [0.000 ,  9.630]  z [13.872, 17.302]
-    //    → centre ( 0.000,  4.815, 15.587 )   half (1.715, 4.815, 1.715)
-    //
-    //  bump2 vertices:  x [ 0.835 , 1.243]  y [-0.313,  0.096]  z [-7.458, -5.458]
-    //    → centre ( 1.039, -0.108, -6.458 )   half (0.204, 0.204, 1.000)
-    //
-    //  bump3 vertices:  x [-7.429 ,-7.021]  y [-0.278,  0.130]  z [-10.358, -8.358]
-    //    → centre (-7.225, -0.074, -9.358 )   half (0.204, 0.204, 1.000)
-    //
-    static const int NUM_OBS = 3;
-    Obstacle gObs[NUM_OBS];
-
-    // bump1 — tall block
-    gObs[0] = MakeObstacle("bump1.obj", celShader,
-        btVector3(1.715f, 4.815f, 1.715f),
-        {0.0f, 4.815f, 15.587f},
-        1.0f, {220, 80, 40, 255});
-
-    // bump2 — small speed strip
-    gObs[1] = MakeObstacle("bump2.obj", celShader,
-        btVector3(0.204f, 0.204f, 1.0f),
-        {1.039f, -0.108f, -6.458f},
-        1.0f, {255, 200, 50, 255});
-
-    // bump3 — small speed strip
-    gObs[2] = MakeObstacle("bump3.obj", celShader,
-        btVector3(0.204f, 0.204f, 1.0f),
-        {-7.225f, -0.074f, -9.358f},
-        1.0f, {80, 180, 255, 255});
+    static const int NUM_OBS = 0;     // set to 3 and uncomment below to re-enable
+    // Obstacle gObs[3];
+    // gObs[0] = MakeObstacle("bump1.obj", celShader,
+    //     btVector3(1.715f, 4.815f, 1.715f), {0.0f, 4.815f, 15.587f},
+    //     1.0f, {220, 80, 40, 255});
+    // gObs[1] = MakeObstacle("bump2.obj", celShader,
+    //     btVector3(0.204f, 0.204f, 1.0f), {1.039f, -0.108f, -6.458f},
+    //     1.0f, {255, 200, 50, 255});
+    // gObs[2] = MakeObstacle("bump3.obj", celShader,
+    //     btVector3(0.204f, 0.204f, 1.0f), {-7.225f, -0.074f, -9.358f},
+    //     1.0f, {80, 180, 255, 255});
 
     // =========================================================================
-    //  PHYSICS INPUT STATE  (replaces the old physics state vars)
+    //  PHYSICS INPUT STATE
     // =========================================================================
-    float steerAngle  = 0.0f;   // current steering (we keep applying to vehicle)
-    float steerSpeed  = 2.5f;
-    float steerReturn = 5.0f;
-    float maxSteer    = 35.0f * DEG2RAD;
+    // Step 3 tuning constants
+    float maxSteer      = 35.0f * DEG2RAD;  // maximum steer at low speed
+    float steerInRate   = 3.5f;             // how fast steer ramps IN  (lerp speed)
+    float steerOutRate  = 7.0f;             // how fast steer returns to 0 (2x faster)
+    float steerTarget   = 0.0f;             // what the player is asking for
+    float steerSmoothed = 0.0f;             // actual value sent to vehicle (smoothed)
 
-    const float MAX_ENGINE = 3000.0f;   // Newtons applied to rear wheels
-    const float MAX_BRAKE  = 160.0f;    // N·m braking torque
+    float engineTarget   = 0.0f;            // raw engine force target
+    float engineSmoothed = 0.0f;            // smoothed engine force
+    float engineInRate   = 6.0f;            // ramp-up rate
+    float engineOutRate  = 10.0f;           // ramp-down / engine-off rate
+
+    const float MAX_ENGINE = 3000.0f;
+    const float MAX_BRAKE  = 160.0f;
+
 
     // =========================================================================
     //  STATE READ-BACK  (will be filled from Bullet each frame)
@@ -351,47 +336,118 @@ int main()
         if (dt > 0.05f) dt = 0.05f;   // safety clamp
 
         // =====================================================================
-        //  STEERING INPUT  (raw, same style as Step 0)
-        // =====================================================================
-        if (IsKeyDown(KEY_A))      steerAngle += steerSpeed * dt;
-        else if (IsKeyDown(KEY_D)) steerAngle -= steerSpeed * dt;
-        else {
-            if (steerAngle > 0) { steerAngle -= steerReturn * dt; if (steerAngle < 0) steerAngle = 0; }
-            if (steerAngle < 0) { steerAngle += steerReturn * dt; if (steerAngle > 0) steerAngle = 0; }
-        }
-        if (steerAngle >  maxSteer) steerAngle =  maxSteer;
-        if (steerAngle < -maxSteer) steerAngle = -maxSteer;
-
-        // Apply steering to front wheels
-        vehicle->setSteeringValue(steerAngle, 0);
-        vehicle->setSteeringValue(steerAngle, 1);
-
-        // =====================================================================
-        //  ENGINE / BRAKE INPUT
+        //  STEP 3: INPUT SMOOTHING + SPEED-SENSITIVE STEERING
         // =====================================================================
         float curSpeedKmh = vehicle->getCurrentSpeedKmHour();
+        float absSpeedKmh = fabsf(curSpeedKmh);
 
-        float engineForce = 0.0f;
-        float brakeForce  = 0.0f;
+        // --- Speed-sensitive max steer ---
+        // At 0 km/h  → full 35°
+        // At 120 km/h → reduced to 12° (NFS-style)
+        float speedFactor  = 1.0f - 0.77f * (absSpeedKmh / 120.0f);
+        if (speedFactor < 0.23f) speedFactor = 0.23f;
+        float effectiveMax = maxSteer * speedFactor;
+
+        // --- Raw steer target from key press ---
+        if (IsKeyDown(KEY_A))       steerTarget =  effectiveMax;
+        else if (IsKeyDown(KEY_D))  steerTarget = -effectiveMax;
+        else                        steerTarget =  0.0f;
+
+        // --- Lerp steer toward target ---
+        // Turn in: slower  |  Return to 0: 2× faster (feels snappy on release)
+        float steerRate = (fabsf(steerTarget) > 0.001f) ? steerInRate : steerOutRate;
+        steerSmoothed += (steerTarget - steerSmoothed) * steerRate * dt;
+
+        // Clamp to effective max
+        if (steerSmoothed >  effectiveMax) steerSmoothed =  effectiveMax;
+        if (steerSmoothed < -effectiveMax) steerSmoothed = -effectiveMax;
+
+        // Apply to front wheels
+        vehicle->setSteeringValue(steerSmoothed, 0);
+        vehicle->setSteeringValue(steerSmoothed, 1);
+
+        // =====================================================================
+        //  ENGINE + BRAKE (with force smoothing)
+        // =====================================================================
+        float brakeForce = 0.0f;
 
         if (IsKeyDown(KEY_W)) {
-            if (curSpeedKmh < -2.0f) brakeForce = MAX_BRAKE;   // brake first
-            else                      engineForce = MAX_ENGINE;
+            if (curSpeedKmh < -2.0f) { brakeForce = MAX_BRAKE; engineTarget = 0.0f; }
+            else                       engineTarget = MAX_ENGINE;
         }
         else if (IsKeyDown(KEY_S)) {
-            if (curSpeedKmh > 2.0f)  brakeForce  = MAX_BRAKE;  // brake first
-            else                      engineForce = -MAX_ENGINE * 0.5f; // reverse
+            if (curSpeedKmh > 2.0f)  { brakeForce = MAX_BRAKE; engineTarget = 0.0f; }
+            else                       engineTarget = -MAX_ENGINE * 0.5f;
+        }
+        else {
+            engineTarget = 0.0f;  // coast
+
+            // Idle braking: simulates rolling resistance + engine braking.
+            // Heavier when nearly stopped (prevents infinite creep).
+            // Light at speed (natural coast-down feel).
+            if (absSpeedKmh < 3.0f)
+                brakeForce = MAX_BRAKE * 0.20f;  // gentle hold when nearly stopped
+            else
+                brakeForce = MAX_BRAKE * 0.04f;  // light engine-brake at speed
         }
 
+        // Lerp engine force; snap to zero to kill floating-point residual
+        float engRate = (fabsf(engineTarget) > 0.1f) ? engineInRate : engineOutRate;
+        engineSmoothed += (engineTarget - engineSmoothed) * engRate * dt;
+        if (fabsf(engineSmoothed) < 1.0f) engineSmoothed = 0.0f; // kill ghost forces
+
         // RWD: engine to rear wheels only
-        vehicle->applyEngineForce(engineForce, 2);
-        vehicle->applyEngineForce(engineForce, 3);
+        vehicle->applyEngineForce(engineSmoothed, 2);
+        vehicle->applyEngineForce(engineSmoothed, 3);
 
         // Brakes on all 4 wheels
         vehicle->setBrake(brakeForce, 0);
         vehicle->setBrake(brakeForce, 1);
         vehicle->setBrake(brakeForce, 2);
         vehicle->setBrake(brakeForce, 3);
+
+
+        // =====================================================================
+        //  R KEY: RESET CAR UPRIGHT
+        //  Snaps the car back to upright orientation at its current XZ position.
+        //  Essential escape hatch when the car is stuck flipped.
+        // =====================================================================
+        if (IsKeyPressed(KEY_R)) {
+            btTransform cur;
+            chassis->getMotionState()->getWorldTransform(cur);
+            btVector3 pos = cur.getOrigin();
+
+            btTransform upright;
+            upright.setIdentity();
+            upright.setOrigin(btVector3(pos.x(), 0.80f, pos.z()));
+
+            chassis->setWorldTransform(upright);
+            chassis->getMotionState()->setWorldTransform(upright);
+            chassis->setLinearVelocity (btVector3(0, 0, 0));
+            chassis->setAngularVelocity(btVector3(0, 0, 0));
+            chassis->activate(true);
+            engineSmoothed = 0.0f;
+        }
+
+        // =====================================================================
+        //  ACTIVE ANTI-ROLL TORQUE
+        //  Reads the car's current up vector and applies a corrective torque
+        //  back toward world-up every frame. Proportional to tilt angle so it
+        //  barely fires when the car is level and ramps up hard as it tips.
+        // =====================================================================
+        {
+            btTransform cur;
+            chassis->getMotionState()->getWorldTransform(cur);
+            btVector3 carUp    = cur.getBasis().getColumn(1); // local Y in world space
+            btVector3 worldUp  = btVector3(0, 1, 0);
+            float     dotUp    = carUp.dot(worldUp);          // 1=flat, 0=sideways, -1=upside-down
+
+            if (dotUp < 0.85f) {     // only fires when tilting > ~32° — ignores micro-tilts
+                btVector3 corrAxis = carUp.cross(worldUp);
+                float     strength = (1.0f - dotUp) * 4000.0f;
+                chassis->applyTorque(corrAxis * strength);
+            }
+        }
 
         // =====================================================================
         //  BULLET SIMULATION STEP
@@ -473,7 +529,7 @@ int main()
                 for (int i = 0; i < 4; i++) {
                     bool front = (i < 2);
                     Matrix m = MatrixRotateX(wheelSpin);
-                    if (front) m = MatrixMultiply(m, MatrixRotateY(steerAngle));
+                    if (front) m = MatrixMultiply(m, MatrixRotateY(steerSmoothed));
                     m = MatrixMultiply(m, MatrixTranslate(
                         wheelLocal[i].x, wheelLocal[i].y, wheelLocal[i].z));
                     m = MatrixMultiply(m, carMat);
@@ -486,21 +542,23 @@ int main()
                 carModel.transform = chassisMat;
                 DrawModel(carModel, {0,0,0}, 1.0f, WHITE);
 
-                // --- Obstacles: render at (0,0,0) — vertex positions already
-                //     encode the Blender world transform, no extra offset needed ---
-                for (int i = 0; i < NUM_OBS; i++)
-                    DrawModel(gObs[i].model, {0,0,0}, 1.0f, gObs[i].tint);
+                // --- Obstacles: disabled for car physics testing ---
+                // for (int i = 0; i < NUM_OBS; i++)
+                //     DrawModel(gObs[i].model, {0,0,0}, 1.0f, gObs[i].tint);
+
 
             EndMode3D();
 
             // --- HUD ---
-            DrawText("Step 1: Bullet btRaycastVehicle", 10, 10, 18, WHITE);
-            DrawText(TextFormat("Speed : %5.1f km/h", fabsf(curSpeedKmh)), 10, 38, 16, GREEN);
-            DrawText(TextFormat("Steer : %5.1f deg",  steerAngle * RAD2DEG),10, 58, 16, YELLOW);
+            DrawText("Step 3: Input Smoothing + Speed-Sensitive Steer", 10, 10, 18, WHITE);
+            DrawText(TextFormat("Speed  : %5.1f km/h",    fabsf(curSpeedKmh)),     10, 38, 16, GREEN);
+            DrawText(TextFormat("Steer  : %5.1f deg",     steerSmoothed * RAD2DEG),10, 58, 16, YELLOW);
+            DrawText(TextFormat("SpeedFactor: %.2f  (steer limit)", speedFactor),   10, 78, 15, {180,180,255,255});
             int y = GetScreenHeight() - 90;
             DrawText("W/S  : Throttle / Brake+Reverse", 10, y,    15, {180,180,180,255});
             DrawText("A/D  : Steer",                    10, y+18, 15, {180,180,180,255});
             DrawText("Mouse: Orbit camera",              10, y+36, 15, {180,180,180,255});
+            DrawText("R    : Reset car upright",         10, y+54, 15, {255,100,100,255});
         EndDrawing();
     }
 
@@ -512,14 +570,14 @@ int main()
     delete vehicle;
     delete raycaster;
 
-    // Cleanup obstacles
-    for (int i = 0; i < NUM_OBS; i++) {
-        gWorld->removeRigidBody(gObs[i].body);
-        if (gObs[i].body->getMotionState()) delete gObs[i].body->getMotionState();
-        delete gObs[i].body;
-        delete gObs[i].shape;
-        UnloadModel(gObs[i].model);
-    }
+    // Cleanup obstacles (disabled — re-enable with the obstacle block above)
+    // for (int i = 0; i < NUM_OBS; i++) {
+    //     gWorld->removeRigidBody(gObs[i].body);
+    //     if (gObs[i].body->getMotionState()) delete gObs[i].body->getMotionState();
+    //     delete gObs[i].body;
+    //     delete gObs[i].shape;
+    //     UnloadModel(gObs[i].model);
+    // }
 
     for (int i = gWorld->getNumCollisionObjects() - 1; i >= 0; i--) {
         btCollisionObject* obj = gWorld->getCollisionObjectArray()[i];
