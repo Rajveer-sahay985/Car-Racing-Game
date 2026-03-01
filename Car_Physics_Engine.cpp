@@ -88,11 +88,66 @@ static Obstacle MakeObstacle(const char* objFile, Shader sh,
 // =============================================================================
 int main()
 {
-    InitWindow(1280, 720, "Vortex Racing — Step 1: Bullet Physics");
+    InitWindow(1280, 720, "Vortex Racing — Bullet Physics");
     SetTargetFPS(60);
 
-    // -------------------------------------------------------------------------
-    //  CEL SHADER  (unchanged from Step 0)
+    // =========================================================================
+    // ██████████████████████████████████████████████████████████████████████
+    //  TUNING PARAMETERS — change these freely to adjust feel!
+    //  All physics, steering, drift and body-feel values live here.
+    // ██████████████████████████████████████████████████████████████████████
+    // =========================================================================
+
+    // --- Engine / Brakes ---
+    const float P_ENGINE_FORCE    = 3000.0f;  // N on rear wheels (higher = faster)
+    const float P_BRAKE_FORCE     = 160.0f;   // N·m (higher = sharper brake)
+    const float P_ENGINE_IN_RATE  = 6.0f;     // throttle ramp speed
+    const float P_ENGINE_OUT_RATE = 10.0f;    // coast ramp speed
+
+    // --- Steering ---
+    const float P_MAX_STEER       = 35.0f * DEG2RAD; // max angle at low speed
+    const float P_STEER_IN_RATE   = 3.5f;    // how fast steer locks in
+    const float P_STEER_OUT_RATE  = 7.0f;    // how fast steer returns to 0
+    const float P_STEER_SPEED_REDUCE = 0.77f;// how much high speed reduces steer
+
+    // --- Suspension ---
+    const float P_SUSP_STIFFNESS  = 25.0f;   // spring stiffness (higher = stiffer ride)
+    const float P_SUSP_DAMPING    = 3.0f;    // oscillation damping
+    const float P_SUSP_COMPRESS   = 4.0f;    // compression damping
+    const float P_SUSP_TRAVEL_CM  = 20.0f;   // max travel in cm
+    const float P_SUSP_MAX_FORCE  = 7000.0f; // max spring force (N)
+    const float P_SUSP_LENGTH     = 0.45f;   // rest length (m)
+    const float P_WHEEL_RADIUS    = 0.333f;  // visual + physics wheel radius (m)
+
+    // --- Chassis ---
+    const float P_CHASSIS_MASS    = 900.0f;  // kg (lower = lighter, easier to drift)
+    const float P_LINEAR_DAMP     = 0.15f;   // air/roll resistance (0=float, 0.3=sluggish)
+    const float P_ANGULAR_DAMP    = 0.75f;   // yaw drag
+    const float P_ROLL_INFLUENCE  = 0.15f;   // anti-roll (0=tippy, 0.5=planted)
+
+    // --- Traction / Front & Rear Grip ---
+    const float P_FRONT_FRICTION  = 2.5f;    // front wheel grip
+    const float P_REAR_FRICTION   = 2.8f;    // rear wheel grip (normal)
+
+    // --- Drift ---
+    const float P_HB_FRICTION     = 0.85f;   // rear grip during handbrake
+                                              //  lower = easier to slide (try 0.6-1.0)
+    const float P_DRIFT_SUSTAIN   = 1.4f;    // how fast grip drops while sliding
+                                              //  higher = slide sustains longer
+    const float P_DRIFT_MIN_FRIC  = 1.2f;    // minimum rear grip during sustained slide
+    const float P_MAX_YAW_RATE    = 2.0f;    // rad/s cap — MAIN anti-spinout dial
+                                              //  lower (1.5) = tighter control
+                                              //  higher (3.0) = wilder spins
+    const float P_COUNTERSTEER    = 600.0f;  // countersteer assist strength
+
+    // --- Body Feel (visual dynamics) ---
+    const float P_BODY_ROLL       = 0.06f;   // lean amount in corners (rad per m/s lateral)
+    const float P_SUSP_BOB_SCALE  = 0.7f;   // suspension height bob multiplier
+    const float P_VIB_AMP         = 0.003f;  // engine vibration amplitude
+    const float P_VIB_FREQ        = 14.0f;   // engine vibration frequency (Hz)
+
+    // =========================================================================
+
     // -------------------------------------------------------------------------
     const char *celVS =
         "#version 410 core\n"
@@ -136,7 +191,7 @@ int main()
     // -------------------------------------------------------------------------
     //  MODELS  (unchanged from Step 0)
     // -------------------------------------------------------------------------
-    float wheelRadius = 0.333f;
+    float wheelRadius = P_WHEEL_RADIUS;
 
     // 0=FL, 1=FR, 2=RL, 3=RR
     Model wheelModels[4] = {
@@ -197,21 +252,21 @@ int main()
     startTrans.setIdentity();
     startTrans.setOrigin(btVector3(0, 0.80f, 0));
 
-    btRigidBody* chassis = MakeRigidBody(900.0f, startTrans, chassisShape);
+    btRigidBody* chassis = MakeRigidBody(P_CHASSIS_MASS, startTrans, chassisShape);
     chassis->setActivationState(DISABLE_DEACTIVATION);
-    chassis->setDamping(0.15f, 0.75f);
+    chassis->setDamping(P_LINEAR_DAMP, P_ANGULAR_DAMP);
 
 
     // ---- btRaycastVehicle ----
     btVehicleRaycaster* raycaster = new btDefaultVehicleRaycaster(gWorld);
 
     btRaycastVehicle::btVehicleTuning tuning;
-    tuning.m_suspensionStiffness    = 25.0f;
-    tuning.m_suspensionDamping      = 3.0f;
-    tuning.m_suspensionCompression  = 4.0f;
-    tuning.m_maxSuspensionTravelCm  = 20.0f;
-    tuning.m_frictionSlip           = 2.5f;
-    tuning.m_maxSuspensionForce     = 7000.0f;
+    tuning.m_suspensionStiffness    = P_SUSP_STIFFNESS;
+    tuning.m_suspensionDamping      = P_SUSP_DAMPING;
+    tuning.m_suspensionCompression  = P_SUSP_COMPRESS;
+    tuning.m_maxSuspensionTravelCm  = P_SUSP_TRAVEL_CM;
+    tuning.m_frictionSlip           = P_FRONT_FRICTION;
+    tuning.m_maxSuspensionForce     = P_SUSP_MAX_FORCE;
 
     btRaycastVehicle* vehicle = new btRaycastVehicle(tuning, chassis, raycaster);
     // Bullet coordinate system: right=X, up=Y, forward=Z
@@ -224,7 +279,7 @@ int main()
     // Wheels connect at the 4 corners, slightly inside the edge.
     const btVector3 wheelDir(0, -1, 0);    // suspension casts downward
     const btVector3 axleDir (-1, 0, 0);    // axle points left
-    const float     suspLen  = 0.45f;      // suspension rest length (m)
+    const float     suspLen  = P_SUSP_LENGTH;
 
     // FL=0, FR=1, RL=2, RR=3
     const btVector3 connPts[4] = {
@@ -239,9 +294,9 @@ int main()
         vehicle->addWheel(connPts[i], wheelDir, axleDir,
                           suspLen, wheelRadius, tuning, isFront[i]);
         btWheelInfo& wi        = vehicle->getWheelInfo(i);
-        wi.m_rollInfluence     = 0.15f;   // anti-roll resistance (higher = harder to flip)
+        wi.m_rollInfluence     = P_ROLL_INFLUENCE;
         if (!isFront[i])
-            wi.m_frictionSlip  = 2.8f;    // rear gets a bit more grip (RWD)
+            wi.m_frictionSlip  = P_REAR_FRICTION;
     }
 
     // =========================================================================
@@ -264,19 +319,19 @@ int main()
     //  PHYSICS INPUT STATE
     // =========================================================================
     // Step 3 tuning constants
-    float maxSteer      = 35.0f * DEG2RAD;  // maximum steer at low speed
-    float steerInRate   = 3.5f;             // how fast steer ramps IN  (lerp speed)
-    float steerOutRate  = 7.0f;             // how fast steer returns to 0 (2x faster)
-    float steerTarget   = 0.0f;             // what the player is asking for
-    float steerSmoothed = 0.0f;             // actual value sent to vehicle (smoothed)
+    float maxSteer      = P_MAX_STEER;
+    float steerInRate   = P_STEER_IN_RATE;
+    float steerOutRate  = P_STEER_OUT_RATE;
+    float steerTarget   = 0.0f;
+    float steerSmoothed = 0.0f;
 
-    float engineTarget   = 0.0f;            // raw engine force target
-    float engineSmoothed = 0.0f;            // smoothed engine force
-    float engineInRate   = 6.0f;            // ramp-up rate
-    float engineOutRate  = 10.0f;           // ramp-down / engine-off rate
+    float engineTarget   = 0.0f;
+    float engineSmoothed = 0.0f;
+    float engineInRate   = P_ENGINE_IN_RATE;
+    float engineOutRate  = P_ENGINE_OUT_RATE;
 
-    const float MAX_ENGINE = 3000.0f;
-    const float MAX_BRAKE  = 160.0f;
+    const float MAX_ENGINE = P_ENGINE_FORCE;
+    const float MAX_BRAKE  = P_BRAKE_FORCE;
 
 
     // =========================================================================
@@ -311,7 +366,7 @@ int main()
         // --- Speed-sensitive max steer ---
         // At 0 km/h  → full 35°
         // At 120 km/h → reduced to 12° (NFS-style)
-        float speedFactor  = 1.0f - 0.77f * (absSpeedKmh / 120.0f);
+        float speedFactor  = 1.0f - P_STEER_SPEED_REDUCE * (absSpeedKmh / 120.0f);
         if (speedFactor < 0.23f) speedFactor = 0.23f;
         float effectiveMax = maxSteer * speedFactor;
 
@@ -407,16 +462,15 @@ int main()
         //  Sustain slide = 1.4-2.0 so the drift keeps going after handbrake release
         float targetRearFriction;
         if (handbrake) {
-            targetRearFriction = 0.85f;   // controlled slide — NOT a full lock
+            targetRearFriction = P_HB_FRICTION;
         } else if (isDrifting) {
-            // Slide self-sustains: friction drops with drift depth
-            targetRearFriction = 2.8f - driftRatio * 1.4f;
-            if (targetRearFriction < 1.2f) targetRearFriction = 1.2f;
+            targetRearFriction = P_REAR_FRICTION - driftRatio * P_DRIFT_SUSTAIN;
+            if (targetRearFriction < P_DRIFT_MIN_FRIC) targetRearFriction = P_DRIFT_MIN_FRIC;
         } else {
-            targetRearFriction = 2.8f;    // full RWD grip
+            targetRearFriction = P_REAR_FRICTION;
         }
 
-        static float rearFriction = 2.8f;
+        static float rearFriction = P_REAR_FRICTION;
         float frictionRate = handbrake ? 18.0f : 6.0f;  // fast in, slow out
         rearFriction += (targetRearFriction - rearFriction) * frictionRate * dt;
         vehicle->getWheelInfo(2).m_frictionSlip = rearFriction;
@@ -437,7 +491,7 @@ int main()
         {
             btVector3 angVel = chassis->getAngularVelocity();
             float yawRate = angVel.y();
-            const float MAX_YAW = 2.0f;   // rad/s cap
+            const float MAX_YAW = P_MAX_YAW_RATE;
             if (fabsf(yawRate) > MAX_YAW) {
                 float clamped = MAX_YAW * (yawRate > 0 ? 1.0f : -1.0f);
                 chassis->setAngularVelocity(
@@ -456,7 +510,7 @@ int main()
                 float assistStrength = driftRatio * 800.0f * steerDotSlide;
                 // Torque that pushes yaw back toward straight
                 chassis->applyTorque(
-                    btVector3(0, -latSpd * driftRatio * 600.0f, 0));
+                    btVector3(0, -latSpd * driftRatio * P_COUNTERSTEER, 0));
             }
         }
 
@@ -574,9 +628,42 @@ int main()
                 DrawPlane({0,0,0}, {200,200}, {50,50,50,255});
                 DrawGrid(100, 1.0f);
 
+                // =====================================================================
+                //  BODY DYNAMICS: suspension bob + lateral roll + engine vibration
+                //  Reads actual per-wheel suspension compression from Bullet each frame.
+                // =====================================================================
+
+                // 1. Average suspension compression across all 4 wheels
+                float avgSuspComp = 0.0f;
+                for (int wi = 0; wi < 4; wi++) {
+                    vehicle->updateWheelTransform(wi, true);
+                    const btWheelInfo& w = vehicle->getWheelInfo(wi);
+                    // compression ratio: 0 = fully extended, 1 = fully compressed
+                    float comp = 1.0f - (w.m_raycastInfo.m_suspensionLength / P_SUSP_LENGTH);
+                    if (comp < 0) comp = 0;
+                    avgSuspComp += comp;
+                }
+                avgSuspComp /= 4.0f;
+                float bodyBob = avgSuspComp * P_SUSP_BOB_SCALE * P_SUSP_LENGTH;
+
+                // 2. Engine vibration: scales with speed
+                float vibration = P_VIB_AMP
+                    * (fabsf(curSpeedKmh) / 80.0f)
+                    * sinf((float)GetTime() * P_VIB_FREQ * 6.2832f);
+
+                // 3. Body roll: lean into corners based on lateral g-force
+                //    Clamped to ±10° so it never looks broken
+                float bodyRoll = -latSpd * P_BODY_ROLL * 0.05f;
+                if (bodyRoll >  0.17f) bodyRoll =  0.17f;
+                if (bodyRoll < -0.17f) bodyRoll = -0.17f;
+
+                // Build car matrix: roll → yaw → translate
                 Matrix carMat = MatrixMultiply(
-                    MatrixRotateY(heading),
-                    MatrixTranslate(carPos.x, 0, carPos.z)
+                    MatrixMultiply(
+                        MatrixRotateZ(bodyRoll),
+                        MatrixRotateY(heading)
+                    ),
+                    MatrixTranslate(carPos.x, bodyBob + vibration, carPos.z)
                 );
 
                 // --- Wheels (same matrix construction as Step 0) ---
