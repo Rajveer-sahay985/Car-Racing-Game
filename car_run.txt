@@ -1,0 +1,9 @@
+clang++ Car_Physics_Engine.cpp -std=c++11 \
+-I/opt/homebrew/include \
+-L/opt/homebrew/lib \
+-lraylib \
+-framework OpenGL \
+-framework Cocoa \
+-framework IOKit \
+-framework CoreVideo \
+-o car_main && ./car_main
