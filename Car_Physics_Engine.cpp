@@ -16,25 +16,31 @@ int main(){
         "uniform mat4 matModel;\n"
         "uniform mat4 matNormal;\n"
         "out vec3 fragNormal;\n"
+        "out vec2 fragTexCoord;\n"
         "void main() {\n"
-        "    fragNormal = normalize(vec3(matNormal * vec4(vertexNormal, 0.0)));\n"
-        "    gl_Position = mvp * vec4(vertexPosition, 1.0);\n"
+        "    fragNormal   = normalize(vec3(matNormal * vec4(vertexNormal, 0.0)));\n"
+        "    fragTexCoord = vertexTexCoord;\n"
+        "    gl_Position  = mvp * vec4(vertexPosition, 1.0);\n"
         "}\n";
 
     const char *celFS =
         "#version 410 core\n"
         "in vec3 fragNormal;\n"
+        "in vec2 fragTexCoord;\n"
+        "uniform sampler2D texture0;\n"
         "uniform vec4 colDiffuse;\n"
         "out vec4 finalColor;\n"
         "void main() {\n"
         "    vec3 lightDir = normalize(vec3(0.4, 1.0, 0.3));\n"
         "    float NdotL = dot(normalize(fragNormal), lightDir);\n"
         "    float intensity;\n"
-        "    if      (NdotL > 0.6) intensity = 5.0;\n"
-        "    else if (NdotL > 0.3) intensity = 3.0;\n"
-        "    else if (NdotL > 0.0) intensity = 2.0;\n"
-        "    else                  intensity = 1.0;\n"
-        "    finalColor = vec4(colDiffuse.rgb * intensity, colDiffuse.a);\n"
+        "    if      (NdotL > 0.6) intensity = 1.0;\n"
+        "    else if (NdotL > 0.3) intensity = 0.75;\n"
+        "    else if (NdotL > 0.0) intensity = 0.5;\n"
+        "    else                  intensity = 0.25;\n"
+        "    vec4 texColor = texture(texture0, fragTexCoord);\n"
+        "    vec4 base = texColor * colDiffuse;\n"
+        "    finalColor = vec4(base.rgb * intensity, base.a);\n"
         "}\n";
 
     Shader celShader = LoadShaderFromMemory(celVS, celFS);
@@ -202,7 +208,7 @@ int main(){
 
                     wheelModels[i].transform = m;
                     DrawModel(wheelModels[i], {0,0,0}, 1.0f, WHITE);
-                    DrawModelWires(wheelModels[i], {0,0,0}, 1.0f, BLACK);
+                    //DrawModelWires(wheelModels[i], {0,0,0}, 1.0f, BLACK);
 
                     wWorld[i] = Vector3Transform(wheelLocal[i], carMat);
                 }
@@ -213,7 +219,7 @@ int main(){
                 Matrix chassisMat = MatrixMultiply(MatrixTranslate(0.0f, 0.0f, chassisZOffset), carMat);
                 carModel.transform = chassisMat;
                 DrawModel(carModel, {0,0,0}, 1.0f, WHITE);
-                DrawModelWires(carModel, {0,0,0}, 1.0f, BLACK);
+                //DrawModelWires(carModel, {0,0,0}, 1.0f, BLACK);
             EndMode3D();
 
             // HUD
