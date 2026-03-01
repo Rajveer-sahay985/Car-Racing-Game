@@ -373,6 +373,57 @@ int main()
         vehicle->setBrake(brakeForce, 2);
         vehicle->setBrake(brakeForce, 3);
 
+        // =====================================================================
+        //  STEP 4: DRIFT / TRACTION SYSTEM
+        //  Space = handbrake: cuts rear grip → initiates drift.
+        //  Lateral velocity ratio is used to detect + sustain the slide.
+        // =====================================================================
+
+        // --- Read chassis velocity in local car space ---
+        btTransform driftTrans;
+        chassis->getMotionState()->getWorldTransform(driftTrans);
+        btVector3 vel        = chassis->getLinearVelocity();
+        btVector3 fwdWorld   = driftTrans.getBasis().getColumn(2);  // car's +Z
+        btVector3 rightWorld = driftTrans.getBasis().getColumn(0);  // car's +X
+        float     fwdSpd     = vel.dot(fwdWorld);
+        float     latSpd     = vel.dot(rightWorld); // positive = sliding right
+        float     totalSpd   = btSqrt(vel.x()*vel.x() + vel.z()*vel.z());
+
+        // Drift ratio: 0 = tracking straight, 1 = fully sideways
+        float driftRatio = (totalSpd > 1.0f) ? fabsf(latSpd) / totalSpd : 0.0f;
+        bool  isDrifting = driftRatio > 0.20f;
+
+        // --- Handbrake (Space) ---
+        bool handbrake = IsKeyDown(KEY_SPACE);
+
+        // --- Dynamic rear friction ---
+        //  Normal = 2.8 (grippy RWD)
+        //  Handbrake = 0.4 (almost no rear grip → slides)
+        //  While drifting → friction reduced proportionally so slide sustains
+        float targetRearFriction;
+        if (handbrake) {
+            targetRearFriction = 0.4f;                        // full handbrake
+        } else if (isDrifting) {
+            // Partial grip loss while sliding: lerp 1.8→2.8 based on drift depth
+            targetRearFriction = 2.8f - driftRatio * 1.0f;   // max reduction: -1.0
+            if (targetRearFriction < 1.4f) targetRearFriction = 1.4f;
+        } else {
+            targetRearFriction = 2.8f;                        // full grip
+        }
+
+        // Smoothly lerp rear friction (prevents snap)
+        static float rearFriction = 2.8f;
+        float frictionRate = handbrake ? 20.0f : 8.0f;       // fast lock, slow release
+        rearFriction += (targetRearFriction - rearFriction) * frictionRate * dt;
+
+        vehicle->getWheelInfo(2).m_frictionSlip = rearFriction;
+        vehicle->getWheelInfo(3).m_frictionSlip = rearFriction;
+
+        // Handbrake: heavy rear brake (lock rear wheels to break traction)
+        if (handbrake) {
+            vehicle->setBrake(MAX_BRAKE * 4.0f, 2);
+            vehicle->setBrake(MAX_BRAKE * 4.0f, 3);
+        }
 
         // =====================================================================
         //  R KEY: RESET CAR UPRIGHT
@@ -517,10 +568,18 @@ int main()
             EndMode3D();
 
             // --- HUD ---
-            DrawText("Step 3: Input Smoothing + Speed-Sensitive Steer", 10, 10, 18, WHITE);
-            DrawText(TextFormat("Speed  : %5.1f km/h",    fabsf(curSpeedKmh)),     10, 38, 16, GREEN);
-            DrawText(TextFormat("Steer  : %5.1f deg",     steerSmoothed * RAD2DEG),10, 58, 16, YELLOW);
-            DrawText(TextFormat("SpeedFactor: %.2f  (steer limit)", speedFactor),   10, 78, 15, {180,180,255,255});
+            DrawText("Step 4: Drift / Traction", 10, 10, 18, WHITE);
+            DrawText(TextFormat("Speed      : %5.1f km/h",    fabsf(curSpeedKmh)),      10, 38, 16, GREEN);
+            DrawText(TextFormat("Steer      : %5.1f deg",     steerSmoothed * RAD2DEG), 10, 58, 16, YELLOW);
+            DrawText(TextFormat("Drift      : %3.0f%%  %s",
+                driftRatio * 100.0f,
+                isDrifting ? "<< DRIFTING >>" : ""),
+                10, 78, 16, isDrifting ? Color{255,80,30,255} : Color{160,160,160,255});
+            DrawText(TextFormat("RearFric   : %.2f  (2.8=grip, 0.4=slide)", rearFriction),
+                10, 98, 15, {180,180,255,255});
+            DrawText(IsKeyDown(KEY_SPACE) ? "HANDBRAKE  : ON" : "HANDBRAKE  : off",
+                10, 118, 15, IsKeyDown(KEY_SPACE) ? Color{255,50,50,255} : Color{120,120,120,255});
+
             int y = GetScreenHeight() - 90;
             DrawText("W/S  : Throttle / Brake+Reverse", 10, y,    15, {180,180,180,255});
             DrawText("A/D  : Steer",                    10, y+18, 15, {180,180,180,255});
