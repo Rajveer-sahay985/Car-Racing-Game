@@ -678,7 +678,7 @@ int main()
         if (handbrake && throttleOn && fabsf(steerSmoothed) > 0.05f) {
             float steerNorm    = steerSmoothed / P_MAX_STEER;          // -1 to +1
             float throttleFrac = fabsf(engineSmoothed) / P_ENGINE_FORCE; // 0-1
-            float donutMag     = steerNorm * throttleFrac * P_DONUT_FORCE;
+            float donutMag     = -steerNorm * throttleFrac * P_DONUT_FORCE;
 
             // Apply at rear of car: fwdWorld * -1.3m puts the force behind center of mass
             btVector3 rearRelPos = fwdWorld * (-1.3f);  // world-space offset to rear
