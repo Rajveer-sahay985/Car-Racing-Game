@@ -178,9 +178,13 @@ int main()
     //   Suspension geometric pitch = (frontComp - rearComp) * suspLength / wheelBase * PITCH_SCALE
     //   At 0.15 compression diff: 0.15 * 0.45 / 2.5 * 2.5 = 0.068 rad ≈ 3.9°
     const float P_BODY_PITCH      = 2.5f;    // nose-dive / squat intensity (pitch scale factor)
-    const float P_SUSP_BOB_SCALE  = 0.7f;   // suspension height bob multiplier
+    const float P_SUSP_BOB_SCALE  = 0.7f;   // suspension height bob multiplier (for chassis only)
     const float P_VIB_AMP         = 0.003f;  // engine vibration amplitude
     const float P_VIB_FREQ        = 14.0f;   // engine vibration frequency (Hz)
+    // P_CHASSIS_Y_OFFSET: moves the whole visual car body up (+) or down (-).
+    // Set negative to lower the chassis since bodyBob was raising it above the wheels.
+    // Tune this until the car body sits flush over the wheel arches.
+    const float P_CHASSIS_Y_OFFSET = -0.05f;
 
     // =========================================================================
 
@@ -1096,11 +1100,10 @@ int main()
                     * (fabsf(curSpeedKmh) / 80.0f)
                     * sinf((float)GetTime() * P_VIB_FREQ * 6.2832f);
 
-                // Build car matrix: pitch(X) → roll(Z) → yaw(Y) → translate
-                // MatrixRotateX(bodyPitch): nose dives (negative) or squats (positive)
-                // MatrixRotateZ(bodyRoll):  leans into corners
-                // MatrixRotateY(heading):   world-space yaw
-                // Applied innermost-first: pitch in car-local space, then roll, then yaw.
+                // ── CHASSIS matrix: full 6DOF including pitch (nose-dive/squat) and roll ──
+                // bodyBob raises the chassis body as suspension compresses (visual spring effect).
+                // P_CHASSIS_Y_OFFSET is a static tune parameter — adjust to seat the body flush
+                // in the wheel arches. Negative = lower the body.
                 Matrix carMat = MatrixMultiply(
                     MatrixMultiply(
                         MatrixMultiply(
@@ -1109,44 +1112,50 @@ int main()
                         ),
                         MatrixRotateY(heading)
                     ),
-                    MatrixTranslate(carPos.x, bodyBob + vibration, carPos.z)
+                    MatrixTranslate(carPos.x,
+                                   P_CHASSIS_Y_OFFSET + vibration,
+                                   carPos.z)
+                );
+
+                // ── WHEEL base matrix: yaw + gentle lean only, NO pitch ──
+                //
+                //  KEY FIX — wheelie elimination:
+                //  The old code used carMat for both chassis AND wheels. When bodyPitch tilted
+                //  the chassis (rear squats under acceleration), the front wheels rose with it
+                //  — a full visual wheelie with no suspension illusion whatsoever.
+                //
+                //  Solution: give wheels their own matrix that has:
+                //    • Yaw:   wheels rotate with car heading ✓
+                //    • Lean:  20% of bodyRoll for subtle camber feel ✓
+                //    • Y=0:  wheels anchored at ground level, translate y=0 ✓
+                //    • NO pitch: wheels stay ground-parallel always ✓
+                //
+                //  Result: chassis pitches visibly over stationary wheels → looks like real
+                //  suspension compressing/extending, with no fake wheelie.
+                float wheelLean = bodyRoll * 0.2f;  // subtle camber (20% of chassis lean)
+                Matrix wheelBaseMat = MatrixMultiply(
+                    MatrixMultiply(
+                        MatrixRotateZ(wheelLean),
+                        MatrixRotateY(heading)
+                    ),
+                    MatrixTranslate(carPos.x, 0.0f, carPos.z)  // wheels always at ground (y=0)
                 );
 
                 // --- Wheels: front use wheelSpin (FL, index 0), rear use rearWheelSpin ---
-                //
-                // Issue #3 fix 3 (corrected): wheel Y in car-LOCAL space.
-                //
-                //  The previous attempt used Bullet's world-space wWorldY as a local Y value.
-                //  BUG: carMat contains pitch + roll rotations, so local Y ≠ world Y when the
-                //  car is tilted. Using world Y as local Y sheared/sank the wheels dramatically.
-                //
-                //  CORRECT APPROACH: stay in car-local space.
-                //  bodyBob already lifts carMat by avgSuspComp * scale * suspLen.
-                //  To keep wheel bottoms at world Y=0 (ground), subtract bodyBob from local Y:
-                //    world_wheel_Y = (wheelRadius - bodyBob) + bodyBob = wheelRadius ✓
-                //
-                //  Per-wheel variation: add (comp[i] - avgComp) * suspLen * smallFactor for
-                //  subtle individual suspension travel. Factor < 1 ensures no float on flat ground
-                //  (because on flat ground comp[i] ≈ avgComp → delta ≈ 0).
+                // Each wheel placed at wheelLocal[i].y = wheelRadius in wheelBaseMat space.
+                // wheelBaseMat.y = 0 → world wheel center = wheelRadius → bottom at y=0 ✓
                 for (int i = 0; i < 4; i++) {
                     bool front = (i < 2);
-
-                    // Car-local wheel Y — corrected for chassis vertical offset
-                    float suspTravel = (comp[i] - avgSuspComp) * P_SUSP_LENGTH * 0.55f;
-                    float renderWY   = wheelLocal[i].y - bodyBob + suspTravel;
-
-                    // Front: Bullet's actual rotation (FL index 0)
-                    // Rear:  custom RPM-driven accumulator (handles burnout over-spin)
                     Matrix m = MatrixRotateX(front ? wheelSpin : rearWheelSpin);
                     if (front) m = MatrixMultiply(m, MatrixRotateY(steerSmoothed));
                     m = MatrixMultiply(m, MatrixTranslate(
-                        wheelLocal[i].x, renderWY, wheelLocal[i].z));
-                    m = MatrixMultiply(m, carMat);
+                        wheelLocal[i].x, wheelLocal[i].y, wheelLocal[i].z));
+                    m = MatrixMultiply(m, wheelBaseMat);  // no pitch — stays on ground
                     wheelModels[i].transform = m;
                     DrawModel(wheelModels[i], {0,0,0}, 1.0f, WHITE);
                 }
 
-                // --- Chassis (same as Step 0) ---
+                // --- Chassis: uses full carMat (pitch + roll + yaw) ---
                 Matrix chassisMat = MatrixMultiply(MatrixTranslate(0, 0, -0.1f), carMat);
                 carModel.transform = chassisMat;
                 DrawModel(carModel, {0,0,0}, 1.0f, WHITE);
