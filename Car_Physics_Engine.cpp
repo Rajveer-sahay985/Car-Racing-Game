@@ -577,10 +577,18 @@ int main()
         if (rearSpinOmega < 0.0f) rearSpinOmega = 0.0f;
 
         // Friction derived from slip ratio (physical relationship)
+        // Over-spin: wheel spinning faster than car → tire slip → low friction
         float slip      = fmaxf(0.0f, rearSpinOmega - carOmegas);  // excess spin
         float slipRatio = fminf(1.0f, slip / (refOmega + 0.01f));  // 0=grip, 1=full slip
-        rearFriction    = P_REAR_FRICTION      * (1.0f - slipRatio)
-                        + P_LAUNCH_SPIN_FRIC   * slipRatio;
+        rearFriction    = P_REAR_FRICTION    * (1.0f - slipRatio)
+                        + P_LAUNCH_SPIN_FRIC * slipRatio;
+
+        // HIGH-SPEED HANDBRAKE OVERRIDE
+        // Slip-ratio above only handles OVER-spin (wheel > car speed).
+        // Locked rear wheel = UNDER-spin (wheel=0, car moving forward).
+        // slip = max(0, 0 - carOmega) = 0  →  slipRatio=0  →  rearFriction=2.8 (WRONG!)
+        // Fix: directly set the low slide friction needed for the rear to actually slide.
+        if (highSpdHB) rearFriction = P_HB_HIGH_SPD_FRIC;
 
         vehicle->getWheelInfo(2).m_frictionSlip = rearFriction;
         vehicle->getWheelInfo(3).m_frictionSlip = rearFriction;
@@ -806,7 +814,14 @@ int main()
         {
             static float rearVisualOmega = 0.0f;
 
-            float carDir      = (curSpeedKmh > -0.1f) ? 1.0f : -1.0f; // +1 fwd, -1 rev
+            // carDir: +1 forward, -1 backward.
+            // Use ±0.8 km/h dead zone with hysteresis to prevent direction flip
+            // when car barely moves — avoids snap when releasing S while coasting.
+            float carDir;
+            if      (curSpeedKmh >  0.8f) carDir =  1.0f;  // clearly forward
+            else if (curSpeedKmh < -0.8f) carDir = -1.0f;  // clearly backward
+            else carDir = (rearVisualOmega >= 0.0f) ? 1.0f : -1.0f; // dead zone: keep current
+
             float rollingOmega = carOmegas * carDir;  // direction-aware rolling speed
 
             float targetVisualOmega;
