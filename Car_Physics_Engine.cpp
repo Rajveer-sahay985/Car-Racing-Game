@@ -456,11 +456,17 @@ int main()
         vehicle->applyEngineForce(engineSmoothed, 2);
         vehicle->applyEngineForce(engineSmoothed, 3);
 
-        // Brakes on all 4 wheels
-        vehicle->setBrake(brakeForce, 0);
-        vehicle->setBrake(brakeForce, 1);
-        vehicle->setBrake(brakeForce, 2);
-        vehicle->setBrake(brakeForce, 3);
+        // RWD brake bias: front wheels do most of the heavy braking (70% front / 30% rear).
+        // This matches a real RWD car where front weight transfer under braking means
+        // the front tyres have more load and can absorb more brake force safely.
+        // Idle / engine braking: only rear wheels resist (RWD engine braking is rear-axle only).
+        bool activebraking = IsKeyDown(KEY_W) || IsKeyDown(KEY_S);
+        float frontBrake = activebraking ? (brakeForce * 0.70f) : (brakeForce * 0.20f);
+        float rearBrake  = activebraking ? (brakeForce * 0.30f) : (brakeForce * 0.80f);
+        vehicle->setBrake(frontBrake, 0);
+        vehicle->setBrake(frontBrake, 1);
+        vehicle->setBrake(rearBrake,  2);
+        vehicle->setBrake(rearBrake,  3);
 
         // =====================================================================
         //  ARCADE DRIFT SYSTEM — research-based fake drift
@@ -596,24 +602,37 @@ int main()
                         + P_LAUNCH_SPIN_FRIC * slipRatio;
 
         // HIGH-SPEED HANDBRAKE OVERRIDE
-        // Slip-ratio above only handles OVER-spin (wheel > car speed).
-        // Locked rear wheel = UNDER-spin (wheel=0, car moving forward).
-        // slip = max(0, 0 - carOmega) = 0  →  slipRatio=0  →  rearFriction=2.8 (WRONG!)
-        // Fix: directly set the low slide friction needed for the rear to actually slide.
-        if (highSpdHB) rearFriction = P_HB_HIGH_SPD_FRIC;
+        // Use a smooth speed-blended factor instead of a binary threshold so there is
+        // no hard snap in grip or braking when the car slows through P_HB_SPEED_THRESH.
+        //   At high speed (>threshold): hbFactor ≈ 1.0 → full drift friction (0.35)
+        //   At low speed  (<threshold): hbFactor ≈ 0.0 → normal rear friction (2.8)
+        //   Transition is blended over ±4 km/h around the threshold → smooth.
+        float hbFactor = 0.0f;
+        if (handbrake) {
+            // Smoothstep-style blend: 1 at high speed, 0 at low speed
+            float t = (absSpeedKmh - P_HB_SPEED_THRESH + 4.0f) / 8.0f;
+            if (t < 0.0f) t = 0.0f;
+            if (t > 1.0f) t = 1.0f;
+            hbFactor = t * t * (3.0f - 2.0f * t);  // smoothstep
+        }
+
+        if (highSpdHB) {
+            // Blend from normal rear friction to low drift friction
+            rearFriction = P_REAR_FRICTION * (1.0f - hbFactor)
+                         + P_HB_HIGH_SPD_FRIC * hbFactor;
+        }
 
         vehicle->getWheelInfo(2).m_frictionSlip = rearFriction;
         vehicle->getWheelInfo(3).m_frictionSlip = rearFriction;
 
         if (highSpdHB) {
-            // REAL HANDBRAKE: lock rear, free front
-            // Rear slows/locks → rear slides when yaw begins
-            // Engine (W) overpowers partially → rear wheel spin against locked brake
-            // Front free → A/D steers the arc cleanly
-            vehicle->setBrake(MAX_BRAKE * 2.8f, 2);  // lock rear-left
-            vehicle->setBrake(MAX_BRAKE * 2.8f, 3);  // lock rear-right
-            vehicle->setBrake(0.0f, 0);               // front-left: totally free
-            vehicle->setBrake(0.0f, 1);               // front-right: totally free
+            // REAL HANDBRAKE: lock rear, free front — rear slides, front steers the arc
+            // Brake force also blended with speed so it doesn't hard-lock at the threshold
+            float hbBrake = MAX_BRAKE * 2.8f * hbFactor;
+            vehicle->setBrake(hbBrake, 2);
+            vehicle->setBrake(hbBrake, 3);
+            vehicle->setBrake(0.0f, 0);
+            vehicle->setBrake(0.0f, 1);
         } else if (lowSpdHB) {
             // Low-speed: light front brake (weight transfer for launch)
             vehicle->setBrake(MAX_BRAKE * 0.6f, 0);
@@ -861,14 +880,19 @@ int main()
                 // W+SPACE burnout / drift over-spin: fast forward spin-up
                 targetVel = rearSpinOmega;
                 velRate   = 14.0f;
+            } else if (absSpeedKmh < 1.5f && !throttleOn && extraOmega < 0.5f) {
+                // Near-stopped and no throttle: snap wheel spin to 0 quickly.
+                // This prevents the "hover/glide" effect where rear wheels keep
+                // spinning visually after the car has physically stopped.
+                // Rate 25/s → spin decays from any value to <0.01 in ~0.25s.
+                targetVel = 0.0f;
+                velRate   = 25.0f;
             } else {
-                // All other states — W-only launch, normal forward, coasting, reverse, stopping.
-                // Use Bullet's actual wheel rotation rate so W-only launch burnout shows correctly.
-                //   W-only launch: engine torque spins wheel physically above car speed → burnout ✓
-                //   Reverse (S):   wheelOmegaActual is negative → rearWheelVel goes negative ✓
-                //   S released:    wheelOmegaActual decelerates negative→0 (no near-stop branch
-                //                  to force it to 0 prematurely) → smooth stop, NO snap ✓
-                //   Coast / stop:  wheelOmegaActual → 0 naturally ✓
+                // All other states — W-only launch, normal forward, coasting, reverse.
+                // Use Bullet's actual wheel rotation so W-only burnout shows correctly.
+                //   W-only launch: engine torque physically spins wheel above car speed → burnout ✓
+                //   Reverse (S):   wheelOmegaActual is negative → rear spins backward ✓
+                //   S released:    wheelOmegaActual smoothly approaches 0 from below → no snap ✓
                 targetVel = wheelOmegaActual;
                 velRate   = 5.0f;
             }
@@ -918,6 +942,26 @@ int main()
             BeginMode3D(camera);
                 DrawPlane({0,0,0}, {200,200}, {50,50,50,255});
                 DrawGrid(100, 1.0f);
+
+                // Shadow disc: drawn flat on the ground directly under the car.
+                // Makes ground contact visually obvious — very cheap (just a circle).
+                // Radius scales slightly with speed to give a subtle "speed blob" feel.
+                {
+                    float shadowR = 1.15f + absSpeedKmh * 0.003f;
+                    int   steps   = 24;
+                    for (int s = 0; s < steps; s++) {
+                        float a0 = (float)s       / steps * 6.2832f;
+                        float a1 = (float)(s + 1) / steps * 6.2832f;
+                        Vector3 p0 = { carPos.x + cosf(a0) * shadowR,
+                                       0.005f,
+                                       carPos.z + sinf(a0) * shadowR };
+                        Vector3 p1 = { carPos.x + cosf(a1) * shadowR,
+                                       0.005f,
+                                       carPos.z + sinf(a1) * shadowR };
+                        DrawTriangle3D({carPos.x, 0.005f, carPos.z}, p0, p1,
+                                       {0, 0, 0, 80});
+                    }
+                }
 
                 // =====================================================================
                 //  BODY DYNAMICS: suspension bob + lateral roll + engine vibration
