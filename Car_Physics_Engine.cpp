@@ -623,8 +623,11 @@ int main()
         prevThrottle = throttleOn;
 
         // Is the car in the wheel-spin phase?
+        // Use !highSpdHB (not !handbrake) so low-speed SPACE still allows rear wheel spin.
+        // At low speed: SPACE = front brake only → rear should still spin freely.
+        // At high speed: SPACE = real rear lock → skip launch (rear handled separately).
         launching = throttleOn && absSpeedKmh < P_LAUNCH_SPEED_KMH
-                    && !handbrake && !isDrifting;
+                    && !highSpdHB && !isDrifting;
         launchT   = launching ? (absSpeedKmh / P_LAUNCH_SPEED_KMH) : 1.0f;
 
         // A) Torque-steer kick on fresh throttle
