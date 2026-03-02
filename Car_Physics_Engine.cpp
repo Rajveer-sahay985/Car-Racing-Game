@@ -545,8 +545,15 @@ int main()
         // ─────────────────────────────────────────────────────────────────────
         static float rearSpinOmega = 0.0f;  // persists between frames
         static float rearFriction  = P_REAR_FRICTION;
-        float carOmegas = (totalSpd > 0.1f) ? (totalSpd / P_WHEEL_RADIUS) : 0.0f;
-        float refOmega  = (P_LAUNCH_SPEED_KMH / 3.6f) / P_WHEEL_RADIUS;  // reference max spin
+
+        // signedCarOmega: SIGNED wheel speed derived from car's actual forward velocity.
+        // Positive = forward, Negative = reversing.
+        // fwdSpd is car velocity projected onto its own heading (Bullet local +Z).
+        // This MUST be signed so that reverse (S) gives a negative target omega,
+        // allowing rearSpinOmega to go negative and the visual accumulator to roll backward.
+        float signedCarOmega = fwdSpd / P_WHEEL_RADIUS;
+        float carOmegas      = fabsf(signedCarOmega);  // magnitude — used only for slip/friction math
+        float refOmega       = (P_LAUNCH_SPEED_KMH / 3.6f) / P_WHEEL_RADIUS;  // reference max spin
 
         float targetRearOmega, omegaUp, omegaDown;
         if (highSpdHB) {
@@ -559,23 +566,27 @@ int main()
             omegaUp = 14.0f; omegaDown = 0.8f;  // quick spin-up, VERy slow spin-down
         } else if (launching && !handbrake) {
             // W only (no SPACE): normal rolling — wheels track car speed exactly
-            // No visual over-spin without SPACE; spinOffset stays at 0; no elastic snap
-            targetRearOmega = carOmegas;
+            targetRearOmega = signedCarOmega;  // signed; always positive here (launching guards it)
             omegaUp = 8.0f; omegaDown = 8.0f;
         } else if (isDrifting && throttleOn) {
             // Sustained drift: spin proportional to sideways angle
             targetRearOmega = carOmegas * (1.0f + driftRatio * 1.5f);
             omegaUp = 5.0f; omegaDown = 2.0f;
         } else {
-            // No throttle (S pressed, coasting, car stopped):
-            // Decay quickly to car rolling speed — no reason to over-spin with no engine
-            targetRearOmega = carOmegas;
-            omegaUp = 3.0f; omegaDown = 8.0f;  // fast return to rolling; ~0.2s to stop
+            // No throttle, S pressed, coasting, or reversing:
+            // SIGNED target so reverse correctly drives rearSpinOmega negative.
+            // On S-release: signedCarOmega rises from negative → 0 smoothly,
+            // rearSpinOmega follows without ever jumping to a positive value.
+            targetRearOmega = signedCarOmega;
+            omegaUp = 3.0f; omegaDown = 8.0f;
         }
 
         float omegaRate = (targetRearOmega > rearSpinOmega) ? omegaUp : omegaDown;
         rearSpinOmega  += (targetRearOmega - rearSpinOmega) * omegaRate * dt;
-        if (rearSpinOmega < 0.0f) rearSpinOmega = 0.0f;
+        // DO NOT clamp rearSpinOmega to >= 0 here.
+        // During reverse, rearSpinOmega must stay negative so the visual accumulator
+        // receives a negative target and rolls the wheels backward.
+        // The old clamp to 0 was the root cause of the forward snap on S-release.
 
         // Friction derived from slip ratio (physical relationship)
         // Over-spin: wheel spinning faster than car → tire slip → low friction
@@ -817,37 +828,46 @@ int main()
         //  W only → release:  rearWheelVel tracks signedCarOmega, both reach 0. No snap.
         //  S → release:       rearWheelVel was negative, gently returns to 0. No snap.
         {
-            // wheelOmegaActual: signed omega derived from Bullet's own m_rotation delta
-            // m_rotation increases when rolling FORWARD, decreases when rolling BACKWARD.
-            // This is guaranteed correct regardless of car model orientation or curSpeedKmh sign.
-            // Front wheel (gripped, no over-spin) = ground-truth direction reference.
-            static float rearWheelVel  = 0.0f;
-            static float prevWheelSpin = 0.0f;
-            float deltaAngle       = wheelSpin - prevWheelSpin;
-            prevWheelSpin          = wheelSpin;
-            float wheelOmegaActual = (dt > 0.001f) ? (deltaAngle / dt) : 0.0f;
+            // rearWheelVel accumulator — integrates into rearWheelSpin each frame.
+            //
+            // rearSpinOmega is now SIGNED (negative = reversing), so targetVel is also
+            // signed in all cases. This eliminates the snap on S-release because:
+            //
+            //   S held:     rearSpinOmega < 0  → targetVel < 0  → rearWheelVel < 0 → spins backward ✓
+            //   S released: rearSpinOmega rises from neg→0 smoothly → rearWheelVel follows → no jump ✓
+            //   W / coast:  rearSpinOmega >= 0  → normal forward / stopped behaviour ✓
+            //   Burnout:    extraOmega > 1.5 → fast spin-up path (unchanged) ✓
+            //
+            // REMOVED: the old "near-stop" branch (fabsf(wheelOmegaActual) < 0.3 → targetVel=0)
+            //   That branch fired while rearWheelVel was still NEGATIVE (car decelerating from
+            //   reverse), then lerped from negative to 0, causing rearWheelSpin to momentarily
+            //   INCREASE (forward direction) — the visible snap you reported.
+            static float rearWheelVel = 0.0f;
 
+            // extraOmega: how much rearSpinOmega exceeds rolling speed (burnout over-spin).
+            // carOmegas is the magnitude, so this is always >= 0 and only positive during
+            // forward over-spin (burnout / drift). Not applicable during reverse.
             float extraOmega = fmaxf(0.0f, rearSpinOmega - carOmegas);
 
             float targetVel;
             float velRate;
 
             if (extraOmega > 1.5f) {
-                // Burnout/drift: fast forward spin-up
+                // Burnout / drift over-spin: fast forward spin-up (rearSpinOmega is positive here)
                 targetVel = rearSpinOmega;
                 velRate   = 14.0f;
-            } else if (fabsf(wheelOmegaActual) < 0.3f) {  // near-stop: front wheel barely moving
-                targetVel = 0.0f;
-                velRate   = 10.0f;
             } else {
-                // Normal rolling: match front wheel's actual signed angular velocity
-                // Reverse (S): front wheel delta < 0 → targetVel negative → rear rolls backward ✓
-                targetVel = wheelOmegaActual;
+                // All other states (forward rolling, coasting, reverse, stopping):
+                // Track rearSpinOmega directly — it is signed, so:
+                //   forward  → positive target → wheel spins forward
+                //   reverse  → negative target → wheel spins backward
+                //   stopping → target approaches 0 from either side → smooth stop, no snap
+                targetVel = rearSpinOmega;
                 velRate   = 5.0f;
             }
 
-            rearWheelVel += (targetVel - rearWheelVel) * velRate * dt;
-            rearWheelSpin += rearWheelVel * dt;  // always accumulate — no snap
+            rearWheelVel  += (targetVel - rearWheelVel) * velRate * dt;
+            rearWheelSpin += rearWheelVel * dt;  // integrate — no direct assignment → no snap
         }
 
         // =====================================================================
