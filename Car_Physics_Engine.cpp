@@ -130,10 +130,13 @@ int main()
     const float P_REAR_FRICTION   = 2.8f;    // rear wheel grip (normal)
 
     // --- Drift ---
-    const float P_HB_FRICTION      = 0.85f;  // rear grip during handbrake (try 0.6-1.0)
+    const float P_HB_FRICTION      = 0.85f;  // rear grip: low-speed handbrake (launch feel)
+    const float P_HB_HIGH_SPD_FRIC = 0.35f;  // rear grip: HIGH-SPEED handbrake (drift entry)
+                                              //   lower = more snap, try 0.25-0.5
+    const float P_HB_SPEED_THRESH  = 15.0f;  // km/h threshold between low/high-speed HB modes
     const float P_DRIFT_SUSTAIN    = 2.4f;   // how fast grip drops while sliding
     const float P_DRIFT_MIN_FRIC   = 1.2f;   // minimum rear grip during sustained slide
-    const float P_MAX_YAW_RATE     = 1.5f;   // rad/s cap — MAIN "tight circles" dial
+    const float P_MAX_YAW_RATE     = 1.5f;   // rad/s cap — main anti-spinout dial
                                               //   1.0=very controlled, 2.5=wild spins
     const float P_COUNTERSTEER     = 5000.0f;// countersteer torque assist
 
@@ -505,10 +508,24 @@ int main()
         // --- Handbrake ---
         bool handbrake = IsKeyDown(KEY_SPACE);
 
-        // --- Dynamic rear friction ---
+        // Speed-dependent handbrake mode:
+        //   HIGH SPEED (> P_HB_SPEED_THRESH): REAL handbrake drift entry
+        //     - Rear wheels LOCK (heavy brake) → rear slides freely
+        //     - Engine fights the lock → rear wheel spin against ground
+        //     - Front wheels FREE (no brake) → front steers the arc
+        //     - Combined: W=rear spins, SPACE=rear locked/slipping, A=front steers = DRIFT
+        //
+        //   LOW SPEED (<= P_HB_SPEED_THRESH): launch feel
+        //     - Light front brake only (weight transfer feel)
+        bool highSpdHB = handbrake && absSpeedKmh > P_HB_SPEED_THRESH;
+        bool lowSpdHB  = handbrake && absSpeedKmh <= P_HB_SPEED_THRESH;
+
+        // --- Dynamic rear friction (speed-dependent handbrake) ---
         float targetRearFriction;
-        if (handbrake) {
-            targetRearFriction = P_HB_FRICTION;
+        if (highSpdHB) {
+            targetRearFriction = P_HB_HIGH_SPD_FRIC; // very low → big slide at speed
+        } else if (lowSpdHB) {
+            targetRearFriction = P_HB_FRICTION;       // moderate → controlled at launch
         } else if (isDrifting) {
             targetRearFriction = P_REAR_FRICTION - driftRatio * P_DRIFT_SUSTAIN;
             if (targetRearFriction < P_DRIFT_MIN_FRIC) targetRearFriction = P_DRIFT_MIN_FRIC;
@@ -517,13 +534,22 @@ int main()
         }
 
         static float rearFriction = P_REAR_FRICTION;
-        float frictionRate = handbrake ? 18.0f : 6.0f;
+        float frictionRate = handbrake ? 20.0f : 6.0f;
         rearFriction += (targetRearFriction - rearFriction) * frictionRate * dt;
         vehicle->getWheelInfo(2).m_frictionSlip = rearFriction;
         vehicle->getWheelInfo(3).m_frictionSlip = rearFriction;
 
-        // Handbrake: light front brake only (weight-transfer feel, NOT rear lock)
-        if (handbrake) {
+        if (highSpdHB) {
+            // REAL HANDBRAKE: lock rear, free front
+            // Rear slows/locks → rear slides when yaw begins
+            // Engine (W) overpowers partially → rear wheel spin against locked brake
+            // Front free → A/D steers the arc cleanly
+            vehicle->setBrake(MAX_BRAKE * 2.8f, 2);  // lock rear-left
+            vehicle->setBrake(MAX_BRAKE * 2.8f, 3);  // lock rear-right
+            vehicle->setBrake(0.0f, 0);               // front-left: totally free
+            vehicle->setBrake(0.0f, 1);               // front-right: totally free
+        } else if (lowSpdHB) {
+            // Low-speed: light front brake (weight transfer for launch)
             vehicle->setBrake(MAX_BRAKE * 0.6f, 0);
             vehicle->setBrake(MAX_BRAKE * 0.6f, 1);
         }
@@ -547,12 +573,14 @@ int main()
             chassis->applyCentralForce(rightWorld * (-wallMag));
         }
 
-        // 6. Yaw rate cap — the "invisible hand" that tames the spinout
+        // 6. Yaw rate cap — relaxed during high-speed handbrake for fast drift initiation
         {
-            btVector3 angVel = chassis->getAngularVelocity();
-            float yawRate    = angVel.y();
-            if (fabsf(yawRate) > P_MAX_YAW_RATE) {
-                float clamped = P_MAX_YAW_RATE * (yawRate > 0 ? 1.0f : -1.0f);
+            btVector3 angVel      = chassis->getAngularVelocity();
+            float     yawRate     = angVel.y();
+            // Allow faster rotation when initiating with handbrake at speed
+            float     yawCap      = highSpdHB ? P_MAX_YAW_RATE * 1.5f : P_MAX_YAW_RATE;
+            if (fabsf(yawRate) > yawCap) {
+                float clamped = yawCap * (yawRate > 0 ? 1.0f : -1.0f);
                 chassis->setAngularVelocity(btVector3(angVel.x(), clamped, angVel.z()));
             }
         }
