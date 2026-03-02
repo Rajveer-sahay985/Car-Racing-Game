@@ -830,39 +830,46 @@ int main()
         {
             // rearWheelVel accumulator — integrates into rearWheelSpin each frame.
             //
-            // rearSpinOmega is now SIGNED (negative = reversing), so targetVel is also
-            // signed in all cases. This eliminates the snap on S-release because:
+            // wheelOmegaActual: Bullet's actual rear wheel angular velocity derived from m_rotation.
+            // This is the ground-truth physical spin — it captures W-only launch burnout where
+            // the driven rear wheel (idx 2) physically spins faster than the car moves under
+            // full 3000N engine force at low speed. rearSpinOmega alone can't capture this
+            // because it tracks car speed; wheelOmegaActual reads Bullet's contact-derived rate.
             //
-            //   S held:     rearSpinOmega < 0  → targetVel < 0  → rearWheelVel < 0 → spins backward ✓
-            //   S released: rearSpinOmega rises from neg→0 smoothly → rearWheelVel follows → no jump ✓
-            //   W / coast:  rearSpinOmega >= 0  → normal forward / stopped behaviour ✓
-            //   Burnout:    extraOmega > 1.5 → fast spin-up path (unchanged) ✓
-            //
-            // REMOVED: the old "near-stop" branch (fabsf(wheelOmegaActual) < 0.3 → targetVel=0)
-            //   That branch fired while rearWheelVel was still NEGATIVE (car decelerating from
-            //   reverse), then lerped from negative to 0, causing rearWheelSpin to momentarily
-            //   INCREASE (forward direction) — the visible snap you reported.
-            static float rearWheelVel = 0.0f;
+            // S-release snap fix:
+            //   OLD code had a "near-stop" branch (fabsf(wheelOmegaActual) < 0.3 → targetVel=0).
+            //   That branch fired while rearWheelVel was still NEGATIVE (decelerating from reverse),
+            //   which made rearWheelSpin momentarily increase (forward) — the visible snap.
+            //   Fix: REMOVE that branch entirely. wheelOmegaActual transitions negative→0 smoothly
+            //   on its own as the car brakes to a stop, so rearWheelVel correctly follows it to 0
+            //   from the negative side — no snap possible.
+            static float rearWheelVel  = 0.0f;
+            static float prevWheelSpin = 0.0f;
+            float deltaAngle       = wheelSpin - prevWheelSpin;
+            prevWheelSpin          = wheelSpin;
+            // Signed: negative when car/wheels spin backward (S key), positive forward.
+            // During W-only launch at low speed, this exceeds signedCarOmega due to physical tire slip.
+            float wheelOmegaActual = (dt > 0.001f) ? (deltaAngle / dt) : 0.0f;
 
-            // extraOmega: how much rearSpinOmega exceeds rolling speed (burnout over-spin).
-            // carOmegas is the magnitude, so this is always >= 0 and only positive during
-            // forward over-spin (burnout / drift). Not applicable during reverse.
+            // extraOmega: W+SPACE burnout — how much rear spin exceeds rolling speed.
             float extraOmega = fmaxf(0.0f, rearSpinOmega - carOmegas);
 
             float targetVel;
             float velRate;
 
             if (extraOmega > 1.5f) {
-                // Burnout / drift over-spin: fast forward spin-up (rearSpinOmega is positive here)
+                // W+SPACE burnout / drift over-spin: fast forward spin-up
                 targetVel = rearSpinOmega;
                 velRate   = 14.0f;
             } else {
-                // All other states (forward rolling, coasting, reverse, stopping):
-                // Track rearSpinOmega directly — it is signed, so:
-                //   forward  → positive target → wheel spins forward
-                //   reverse  → negative target → wheel spins backward
-                //   stopping → target approaches 0 from either side → smooth stop, no snap
-                targetVel = rearSpinOmega;
+                // All other states — W-only launch, normal forward, coasting, reverse, stopping.
+                // Use Bullet's actual wheel rotation rate so W-only launch burnout shows correctly.
+                //   W-only launch: engine torque spins wheel physically above car speed → burnout ✓
+                //   Reverse (S):   wheelOmegaActual is negative → rearWheelVel goes negative ✓
+                //   S released:    wheelOmegaActual decelerates negative→0 (no near-stop branch
+                //                  to force it to 0 prematurely) → smooth stop, NO snap ✓
+                //   Coast / stop:  wheelOmegaActual → 0 naturally ✓
+                targetVel = wheelOmegaActual;
                 velRate   = 5.0f;
             }
 
