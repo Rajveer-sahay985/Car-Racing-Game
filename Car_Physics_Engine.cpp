@@ -144,6 +144,13 @@ int main()
     const float P_DRIFT_ANGLE_ENTRY= 8.0f;   // slip angle (°) to enter drift state
     const float P_DRIFT_ANGLE_EXIT = 4.0f;   // slip angle (°) to exit drift state
 
+    // --- RWD Launch / Wheel Spin ---
+    const float P_LAUNCH_SPIN_FRIC = 0.45f;  // rear friction at ZERO speed (full wheel spin)
+                                              //   lower = more spin, harder to control (try 0.3-0.6)
+    const float P_LAUNCH_SPEED_KMH = 22.0f;  // speed at which grip fully recovers
+    const float P_LAUNCH_KICK      = 900.0f; // torque impulse on fresh throttle (N·m·s)
+                                              //   gives the random left/right tail-kick
+
     // --- Body Feel (visual dynamics) ---
     const float P_BODY_ROLL       = 0.06f;   // lean amount in corners (rad per m/s lateral)
     const float P_SUSP_BOB_SCALE  = 0.7f;   // suspension height bob multiplier
@@ -420,7 +427,14 @@ int main()
         // Lerp engine force; snap to zero to kill floating-point residual
         float engRate = (fabsf(engineTarget) > 0.1f) ? engineInRate : engineOutRate;
         engineSmoothed += (engineTarget - engineSmoothed) * engRate * dt;
-        if (fabsf(engineSmoothed) < 1.0f) engineSmoothed = 0.0f; // kill ghost forces
+        if (fabsf(engineSmoothed) < 1.0f) engineSmoothed = 0.0f;
+
+        // LAUNCH: bypass the smooth ramp at low speed.
+        // At <10 km/h with throttle held, hit the rear with full force INSTANTLY.
+        // This causes wheel spin — the car bogs then grips, instead of just rolling.
+        if (IsKeyDown(KEY_W) && curSpeedKmh >= -2.0f && absSpeedKmh < 10.0f) {
+            engineSmoothed = P_ENGINE_FORCE;  // no lerp — full torque NOW
+        }
 
         // RWD: engine to rear wheels only
         vehicle->applyEngineForce(engineSmoothed, 2);
@@ -543,6 +557,35 @@ int main()
             }
         }
 
+
+        // =====================================================================
+        //  RWD LAUNCH / WHEEL SPIN
+        //  Runs AFTER the drift friction system so it can override friction.
+        //  Below P_LAUNCH_SPEED_KMH:
+        //    - Rear tires start with very low grip (wheel spin)
+        //    - Grip ramps QUADRATICALLY as speed builds (slow then snaps)
+        //    - On fresh throttle press: random yaw impulse = torque steer kick
+        // =====================================================================
+        bool        throttleOn    = IsKeyDown(KEY_W) && curSpeedKmh > -2.0f;
+        static bool prevThrottle  = false;
+        bool        freshThrottle = throttleOn && !prevThrottle && absSpeedKmh < 5.0f;
+        prevThrottle = throttleOn;
+
+        // Torque-steer kick: random left or right tail snap on launch
+        if (freshThrottle) {
+            float kickDir = (GetRandomValue(0, 1) == 0) ? 1.0f : -1.0f;
+            chassis->applyTorqueImpulse(btVector3(0, kickDir * P_LAUNCH_KICK, 0));
+        }
+
+        // Friction ramp: 0.45 at rest → 2.8 at P_LAUNCH_SPEED_KMH
+        // Quadratic curve: grip comes in slowly at first then snaps (tyre warmup)
+        if (throttleOn && absSpeedKmh < P_LAUNCH_SPEED_KMH && !handbrake && !isDrifting) {
+            float t = absSpeedKmh / P_LAUNCH_SPEED_KMH;            // 0 → 1
+            float launchFric = P_LAUNCH_SPIN_FRIC
+                               + (P_REAR_FRICTION - P_LAUNCH_SPIN_FRIC) * (t * t);
+            vehicle->getWheelInfo(2).m_frictionSlip = launchFric;
+            vehicle->getWheelInfo(3).m_frictionSlip = launchFric;
+        }
 
         // =====================================================================
         //  R KEY: RESET CAR UPRIGHT
