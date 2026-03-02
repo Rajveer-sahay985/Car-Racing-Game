@@ -380,8 +380,13 @@ int main()
     // =========================================================================
     Vector3 carPos   = { 0, 0, 0 };
     float   heading  = 0.0f;    // yaw angle extracted from chassis matrix
-    float   wheelSpin    = 0.0f;  // front wheels: from Bullet m_rotation
-    float   rearWheelSpin = 0.0f; // rear wheels: engine-RPM-driven (shows spin even at standstill)
+    // Issue #3: separate spin variables for front and rear wheel display.
+    //   wheelSpin        = FL (index 0) rotation  — used for front wheel visual
+    //   rearWheelSpinRef = RL (index 2) rotation  — reference for rear accumulator delta
+    //   rearWheelSpin    = custom accumulator (handles burnout over-spin)
+    float   wheelSpin        = 0.0f;  // front-left Bullet m_rotation (display for FL/FR)
+    float   rearWheelSpinRef = 0.0f;  // rear-left  Bullet m_rotation (delta ref for accumulator)
+    float   rearWheelSpin    = 0.0f;  // rear wheels: velocity accumulator (shows burnout spin)
 
     // =========================================================================
     //  CAMERA  (unchanged from Step 0)
@@ -878,12 +883,14 @@ int main()
         btVector3 fwdBt = chassisTrans.getBasis() * btVector3(0, 0, 1);
         heading = atan2f((float)fwdBt.x(), (float)fwdBt.z());
 
-        // WheelSpin readback:
-        //  Front wheels: use Bullet's actual m_rotation (rolls with car speed)
-        //  Rear wheels:  custom accumulator driven by engine RPM so rear visually
-        //                spins fast even when the car is stationary (wheel spin phase)
+        // Issue #3 fix 1: separate front/rear wheel readback.
+        //   OLD: both front display and rear accumulator reference read from index 2 (RL wheel).
+        //   BUG: front wheel models were showing rear-left wheel rotation — wrong index!
+        //   FIX: front display → index 0 (FL).  Rear accumulator reference → index 2 (RL).
+        vehicle->updateWheelTransform(0, true);
+        wheelSpin        = (float)vehicle->getWheelInfo(0).m_rotation;  // FL — for front visual
         vehicle->updateWheelTransform(2, true);
-        wheelSpin = (float)vehicle->getWheelInfo(2).m_rotation;  // front wheels
+        rearWheelSpinRef = (float)vehicle->getWheelInfo(2).m_rotation;  // RL — for rear delta
 
         // Rear wheel visual: pure velocity-based accumulation — no elastic snap possible
         //
@@ -900,27 +907,15 @@ int main()
         //  W only → release:  rearWheelVel tracks signedCarOmega, both reach 0. No snap.
         //  S → release:       rearWheelVel was negative, gently returns to 0. No snap.
         {
-            // rearWheelVel accumulator — integrates into rearWheelSpin each frame.
-            //
-            // wheelOmegaActual: Bullet's actual rear wheel angular velocity derived from m_rotation.
-            // This is the ground-truth physical spin — it captures W-only launch burnout where
-            // the driven rear wheel (idx 2) physically spins faster than the car moves under
-            // full 3000N engine force at low speed. rearSpinOmega alone can't capture this
-            // because it tracks car speed; wheelOmegaActual reads Bullet's contact-derived rate.
-            //
-            // S-release snap fix:
-            //   OLD code had a "near-stop" branch (fabsf(wheelOmegaActual) < 0.3 → targetVel=0).
-            //   That branch fired while rearWheelVel was still NEGATIVE (decelerating from reverse),
-            //   which made rearWheelSpin momentarily increase (forward) — the visible snap.
-            //   Fix: REMOVE that branch entirely. wheelOmegaActual transitions negative→0 smoothly
-            //   on its own as the car brakes to a stop, so rearWheelVel correctly follows it to 0
-            //   from the negative side — no snap possible.
+            // rearWheelVel accumulator.
+            // Issue #3 fix 2: use rearWheelSpinRef (RL, index 2) for the delta
+            // so the rear accumulator's omega derives from the correct driven wheel.
             static float rearWheelVel  = 0.0f;
-            static float prevWheelSpin = 0.0f;
-            float deltaAngle       = wheelSpin - prevWheelSpin;
-            prevWheelSpin          = wheelSpin;
-            // Signed: negative when car/wheels spin backward (S key), positive forward.
-            // During W-only launch at low speed, this exceeds signedCarOmega due to physical tire slip.
+            static float prevRearSpin  = 0.0f;  // tracks RL m_rotation across frames
+            float deltaAngle       = rearWheelSpinRef - prevRearSpin;
+            prevRearSpin          = rearWheelSpinRef;
+            // wheelOmegaActual: RL wheel's actual angular velocity from Bullet.
+            // Negative when reversing (S), positive forward, high during W-only launch slip.
             float wheelOmegaActual = (dt > 0.001f) ? (deltaAngle / dt) : 0.0f;
 
             // extraOmega: W+SPACE burnout — how much rear spin exceeds rolling speed.
@@ -1117,14 +1112,35 @@ int main()
                     MatrixTranslate(carPos.x, bodyBob + vibration, carPos.z)
                 );
 
-                // --- Wheels: front use wheelSpin (Bullet), rear use rearWheelSpin ---
+                // --- Wheels: front use wheelSpin (FL, index 0), rear use rearWheelSpin ---
+                //
+                // Issue #3 fix 3 (corrected): wheel Y in car-LOCAL space.
+                //
+                //  The previous attempt used Bullet's world-space wWorldY as a local Y value.
+                //  BUG: carMat contains pitch + roll rotations, so local Y ≠ world Y when the
+                //  car is tilted. Using world Y as local Y sheared/sank the wheels dramatically.
+                //
+                //  CORRECT APPROACH: stay in car-local space.
+                //  bodyBob already lifts carMat by avgSuspComp * scale * suspLen.
+                //  To keep wheel bottoms at world Y=0 (ground), subtract bodyBob from local Y:
+                //    world_wheel_Y = (wheelRadius - bodyBob) + bodyBob = wheelRadius ✓
+                //
+                //  Per-wheel variation: add (comp[i] - avgComp) * suspLen * smallFactor for
+                //  subtle individual suspension travel. Factor < 1 ensures no float on flat ground
+                //  (because on flat ground comp[i] ≈ avgComp → delta ≈ 0).
                 for (int i = 0; i < 4; i++) {
                     bool front = (i < 2);
-                    // Front: Bullet's actual rotation | Rear: custom RPM-driven spin
+
+                    // Car-local wheel Y — corrected for chassis vertical offset
+                    float suspTravel = (comp[i] - avgSuspComp) * P_SUSP_LENGTH * 0.55f;
+                    float renderWY   = wheelLocal[i].y - bodyBob + suspTravel;
+
+                    // Front: Bullet's actual rotation (FL index 0)
+                    // Rear:  custom RPM-driven accumulator (handles burnout over-spin)
                     Matrix m = MatrixRotateX(front ? wheelSpin : rearWheelSpin);
                     if (front) m = MatrixMultiply(m, MatrixRotateY(steerSmoothed));
                     m = MatrixMultiply(m, MatrixTranslate(
-                        wheelLocal[i].x, wheelLocal[i].y, wheelLocal[i].z));
+                        wheelLocal[i].x, renderWY, wheelLocal[i].z));
                     m = MatrixMultiply(m, carMat);
                     wheelModels[i].transform = m;
                     DrawModel(wheelModels[i], {0,0,0}, 1.0f, WHITE);
