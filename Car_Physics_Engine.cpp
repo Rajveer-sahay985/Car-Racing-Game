@@ -484,9 +484,14 @@ int main()
 
         // LAUNCH: bypass the smooth ramp at low speed.
         // At <10 km/h with throttle held, hit the rear with full force INSTANTLY.
-        // This causes wheel spin — the car bogs then grips, instead of just rolling.
+        // Bug 2 fix (S→W jitter): also zero brakeSmoothed here.
+        //   When reversing (S) the brake was building up to stop the car.
+        //   At the moment curSpeedKmh crosses -2.0f, the launch fires full engine force
+        //   BUT brakeSmoothed was still mid-ramp (release rate only 4/s) → engine + brake
+        //   fighting each other → oscillation / jitter. Clearing it instantly removes that.
         if (IsKeyDown(KEY_W) && curSpeedKmh >= -2.0f && absSpeedKmh < 10.0f) {
             engineSmoothed = P_ENGINE_FORCE;  // no lerp — full torque NOW
+            brakeSmoothed  = 0.0f;            // kill residual S-key brake so nothing fights the engine
         }
 
         // RWD: engine to rear wheels only
@@ -936,13 +941,14 @@ int main()
                 targetVel = 0.0f;
                 velRate   = 25.0f;
             } else {
-                // All other states — W-only launch, normal forward, coasting, reverse.
-                // Use Bullet's actual wheel rotation so W-only burnout shows correctly.
-                //   W-only launch: engine torque physically spins wheel above car speed → burnout ✓
-                //   Reverse (S):   wheelOmegaActual is negative → rear spins backward ✓
-                //   S released:    wheelOmegaActual smoothly approaches 0 from below → no snap ✓
+                // Normal rolling (W-only launch, forward, coasting, reverse).
+                // Bug 3 fix (rear wheel lag): velRate raised from 5 → 25.
+                //   Old rate 5/s: tau = 0.2s → rear visibly lags behind front for 0.2s
+                //   New rate 25/s: tau = 0.04s → convergence in ~2 frames, imperceptible.
+                //   wheelOmegaActual is derived from the same Bullet m_rotation that drives
+                //   the front wheel display, so at high velRate the rear tracks front exactly.
                 targetVel = wheelOmegaActual;
-                velRate   = 5.0f;
+                velRate   = 25.0f;
             }
 
             rearWheelVel  += (targetVel - rearWheelVel) * velRate * dt;
@@ -1048,9 +1054,13 @@ int main()
 
                 //  Perceptual: brake/throttle force gives IMMEDIATE pitch feel before
                 //  suspension has time to build up compression (lag-compensation).
-                //  forcePitch is negative under braking (dive) and positive under acceleration (squat).
-                float forcePitch = -(brakeSmoothed  / P_BRAKE_FORCE) * 0.07f;
-                forcePitch      += (throttleOn ? (fabsf(engineSmoothed) / P_ENGINE_FORCE) : 0.0f) * 0.045f;
+                //  Bug 1 fix (false burnout pitch): throttle squat ONLY added when not holding
+                //  handbrake. W+SPACE = stationary burnout → car isn't accelerating forward →
+                //  no rear squat. Without this guard, the squat fired even when the car was
+                //  standing still spinning its wheels, which looked obviously fake.
+                float forcePitch = -(brakeSmoothed / P_BRAKE_FORCE) * 0.07f;
+                if (throttleOn && !handbrake)   // real forward acceleration only, not burnout
+                    forcePitch += (fabsf(engineSmoothed) / P_ENGINE_FORCE) * 0.045f;
 
                 // Blend: 50% perceptual (snappy) + 50% physical (confirmed)
                 // Negated: MatrixRotateX convention has opposite sign to what nose-dive implies.
