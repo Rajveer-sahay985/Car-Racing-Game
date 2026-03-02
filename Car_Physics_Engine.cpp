@@ -819,8 +819,12 @@ int main()
         {
             static float rearWheelVel = 0.0f;
 
-            float signedCarOmega = curSpeedKmh / 3.6f / P_WHEEL_RADIUS; // +fwd, -rev
-            float extraOmega     = fmaxf(0.0f, rearSpinOmega - carOmegas);
+            // fwdVel: chassis speed projected onto car's forward axis (m/s), CORRECTLY SIGNED
+            // Negative when reversing. curSpeedKmh from Bullet is always positive (magnitude only)
+            // so we CANNOT use it for signed omega — use dot product instead.
+            float fwdVel        = chassis->getLinearVelocity().dot(fwdWorld);  // m/s, signed
+            float signedCarOmega = fwdVel / P_WHEEL_RADIUS;                    // rad/s, signed
+            float extraOmega    = fmaxf(0.0f, rearSpinOmega - carOmegas);
 
             float targetVel;
             float velRate;
@@ -829,21 +833,19 @@ int main()
                 // Burnout/drift: fast forward spin-up
                 targetVel = rearSpinOmega;
                 velRate   = 14.0f;
-            } else if (fabsf(curSpeedKmh) < 1.0f) {
+            } else if (fabsf(fwdVel) < 0.28f) {  // 0.28 m/s ≈ 1 km/h
                 // Near-stop zone: smoothly zero out regardless of previous direction
-                // Prevents S-release snap: rearWheelVel was negative, car nearly stopped,
-                // target=0 reached at 10/s → wheels just stop, no forward flip
                 targetVel = 0.0f;
                 velRate   = 10.0f;
             } else {
-                // Normal rolling: gently follow signed car speed
+                // Normal rolling: follow actual signed velocity (+fwd, -rev)
                 targetVel = signedCarOmega;
                 velRate   = 3.5f;
             }
 
             rearWheelVel += (targetVel - rearWheelVel) * velRate * dt;
 
-            rearWheelSpin += rearWheelVel * dt;  // always accumulate — no direct assign, no snap
+            rearWheelSpin += rearWheelVel * dt;  // always accumulate — no snap
         }
 
         // =====================================================================
