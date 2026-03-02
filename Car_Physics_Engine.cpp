@@ -802,39 +802,33 @@ int main()
         vehicle->updateWheelTransform(2, true);
         wheelSpin = (float)vehicle->getWheelInfo(2).m_rotation;  // front wheels
 
-        // Rear visual spin — Bullet-base + burnout spin offset
+        // Rear wheel visual: pure velocity-based accumulation — no elastic snap possible
         //
-        //  rearWheelSpin = wheelSpin (Bullet) + spinOffset
+        //  rearWheelVel = smooth angular velocity, always forward during burnout
         //
-        //  wheelSpin  = vehicle->getWheelInfo(2).m_rotation
-        //             = Bullet's actual wheel rotation, perfectly synced with ground
-        //             = positive going forward, negative going backward
-        //             = exactly what front wheels use → both sets sync perfectly
+        //  Burnout active:   targetVel = rearSpinOmega (large) → spin-up at 14/s  (fast)
+        //  Everything else:  targetVel = signedCarOmega      → decel/match at 3.5/s (gentle)
         //
-        //  spinOffset = accumulated EXTRA rotation during burnout ONLY
-        //             = 0 during normal driving/reverse/braking
-        //             = decays exponentially when burnout ends → no snap
+        //  rearWheelSpin is ONLY ever changed by += rearWheelVel * dt
+        //  Never direct-assigned → backward motion is IMPOSSIBLE → no elastic snap
         //
-        //  Result: reverse = Bullet handles direction, offset=0 → correct backward roll
-        //          burnout = ground-synced base + visible over-spin on top
-        //          release = smooth fade, offset → 0, wheels return to normal sync
+        //  W+SPACE → release: rearWheelVel decelerates from 24→0 rad/s over ~1.5s,
+        //                     always moving forward, just slower and slower. No snap.
+        //  W only → release:  rearWheelVel tracks signedCarOmega, both reach 0. No snap.
+        //  S → release:       rearWheelVel was negative, gently returns to 0. No snap.
         {
-            static float spinOffset = 0.0f;
+            static float rearWheelVel = 0.0f;
 
-            float extraOmega = fmaxf(0.0f, rearSpinOmega - carOmegas); // EXCESS above rolling
+            float signedCarOmega = curSpeedKmh / 3.6f / P_WHEEL_RADIUS; // +fwd, -rev
+            float extraOmega     = fmaxf(0.0f, rearSpinOmega - carOmegas);
 
-            if (extraOmega > 1.5f) {  // threshold: only genuine burnout/drift over-spin
-                // Burnout/drift: accumulate extra spin above the rolling base
-                spinOffset += extraOmega * dt;
-            } else {
-                // Normal driving, reverse, coasting: fade offset away
-                // Exponential decay — smooth, no snap
-                spinOffset += (0.0f - spinOffset) * 8.0f * dt;
-                if (fabsf(spinOffset) < 0.001f) spinOffset = 0.0f;
-            }
+            float targetVel = (extraOmega > 1.5f) ? rearSpinOmega : signedCarOmega;
 
-            // Bullet's rotation is the ground-truth base (handles all directions)
-            rearWheelSpin = wheelSpin + spinOffset;
+            // Fast only when lighting up burnout; gentle for all other transitions
+            float velRate = (extraOmega > 1.5f && targetVel > rearWheelVel) ? 14.0f : 3.5f;
+            rearWheelVel += (targetVel - rearWheelVel) * velRate * dt;
+
+            rearWheelSpin += rearWheelVel * dt;  // always accumulate — no direct assign, no snap
         }
 
         // =====================================================================
