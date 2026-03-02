@@ -100,9 +100,14 @@ int main()
 
     // --- Engine / Brakes ---
     const float P_ENGINE_FORCE    = 3000.0f;  // N on rear wheels (higher = faster)
-    const float P_BRAKE_FORCE     = 160.0f;   // N·m (higher = sharper brake)
+    const float P_BRAKE_FORCE     = 160.0f;   // N·m per wheel (higher = sharper max brake)
     const float P_ENGINE_IN_RATE  = 6.0f;     // throttle ramp speed
     const float P_ENGINE_OUT_RATE = 10.0f;    // coast ramp speed
+    // Brake ramping rates — controls how fast brakes bite and release.
+    // Fast bite (12/s): brakes feel responsive but not instantaneous (~1.5 frames to 95%).
+    // Slow release (4/s): residual braking feel; car glides to rest rather than snapping.
+    const float P_BRAKE_IN_RATE   = 12.0f;    // how fast brake force builds up (s⁻¹)
+    const float P_BRAKE_OUT_RATE  = 4.0f;     // how fast brake force bleeds off (s⁻¹)
 
     // --- Steering ---
     const float P_MAX_STEER       = 35.0f * DEG2RAD; // max angle at low speed
@@ -353,6 +358,11 @@ int main()
     float engineInRate   = P_ENGINE_IN_RATE;
     float engineOutRate  = P_ENGINE_OUT_RATE;
 
+    // brakeSmoothed mirrors engineSmoothed: instead of stamping full brake force
+    // onto Bullet in a single frame, we lerp toward the target over time.
+    // This gives the car momentum — it "fights" the stop instead of halting instantly.
+    float brakeSmoothed  = 0.0f;
+
     const float MAX_ENGINE = P_ENGINE_FORCE;
     const float MAX_BRAKE  = P_BRAKE_FORCE;
 
@@ -416,29 +426,48 @@ int main()
         vehicle->setSteeringValue(steerSmoothed, 1);
 
         // =====================================================================
-        //  ENGINE + BRAKE (with force smoothing)
+        //  ENGINE + BRAKE  —  Issue #1 fix: SMOOTHED BRAKE FORCE
+        //
+        //  Problem: brake force was stamped directly onto Bullet each frame.
+        //  A 700 kg car going 80 km/h receiving 160 N·m wheel torque in one frame
+        //  causes an instantaneous deceleration jump — the physics equivalent of
+        //  hitting a wall. There was no inertia in the braking path at all.
+        //
+        //  Fix: brakeTarget is the desired brake force this frame (just like
+        //  engineTarget). brakeSmoothed lerps toward it at P_BRAKE_IN_RATE when
+        //  braking builds and P_BRAKE_OUT_RATE when it bleeds off. The car now
+        //  "fights" the stop: momentum carries it forward while the brakes build,
+        //  then the force fades after key release just like real hydraulic brakes.
         // =====================================================================
-        float brakeForce = 0.0f;
+        float brakeTarget = 0.0f;
 
         if (IsKeyDown(KEY_W)) {
-            if (curSpeedKmh < -2.0f) { brakeForce = MAX_BRAKE; engineTarget = 0.0f; }
+            if (curSpeedKmh < -2.0f) { brakeTarget = MAX_BRAKE; engineTarget = 0.0f; }
             else                       engineTarget = MAX_ENGINE;
         }
         else if (IsKeyDown(KEY_S)) {
-            if (curSpeedKmh > 2.0f)  { brakeForce = MAX_BRAKE; engineTarget = 0.0f; }
+            if (curSpeedKmh > 2.0f)  { brakeTarget = MAX_BRAKE; engineTarget = 0.0f; }
             else                       engineTarget = -MAX_ENGINE * 0.5f;
         }
         else {
             engineTarget = 0.0f;  // coast
 
-            // Idle braking: simulates rolling resistance + engine braking.
-            // Heavier when nearly stopped (prevents infinite creep).
-            // Light at speed (natural coast-down feel).
+            // Idle braking: rolling resistance + engine braking.
+            // Stronger when nearly stopped (prevents creep), lighter at speed.
             if (absSpeedKmh < 3.0f)
-                brakeForce = MAX_BRAKE * 0.20f;  // gentle hold when nearly stopped
+                brakeTarget = MAX_BRAKE * 0.20f;
             else
-                brakeForce = MAX_BRAKE * 0.04f;  // light engine-brake at speed
+                brakeTarget = MAX_BRAKE * 0.04f;
         }
+
+        // Smooth brake force — same pattern as engineSmoothed.
+        // Bite rate (12/s): brakes build quickly but NOT instantly.
+        //   At 60 fps: ~0.2s to reach full pressure — matches hydraulic brake feel.
+        // Release rate (4/s): brakes bleed off slowly so the car glides to rest,
+        //   not snapping to zero deceleration the moment you release the pedal.
+        float brakeRate  = (brakeTarget > brakeSmoothed) ? P_BRAKE_IN_RATE : P_BRAKE_OUT_RATE;
+        brakeSmoothed   += (brakeTarget - brakeSmoothed) * brakeRate * dt;
+        if (brakeSmoothed < 0.5f) brakeSmoothed = 0.0f;  // kill floating-point residual
 
         // Lerp engine force; snap to zero to kill floating-point residual
         float engRate = (fabsf(engineTarget) > 0.1f) ? engineInRate : engineOutRate;
@@ -456,17 +485,28 @@ int main()
         vehicle->applyEngineForce(engineSmoothed, 2);
         vehicle->applyEngineForce(engineSmoothed, 3);
 
-        // RWD brake bias: front wheels do most of the heavy braking (70% front / 30% rear).
-        // This matches a real RWD car where front weight transfer under braking means
-        // the front tyres have more load and can absorb more brake force safely.
-        // Idle / engine braking: only rear wheels resist (RWD engine braking is rear-axle only).
+        // RWD brake bias with smoothed force.
+        // Active braking (W or S): 70% front / 30% rear (weight transfers forward, front grips more).
+        // Idle coast:              20% front / 80% rear (RWD engine braking is rear-axle only).
         bool activebraking = IsKeyDown(KEY_W) || IsKeyDown(KEY_S);
-        float frontBrake = activebraking ? (brakeForce * 0.70f) : (brakeForce * 0.20f);
-        float rearBrake  = activebraking ? (brakeForce * 0.30f) : (brakeForce * 0.80f);
+        float frontBrake = activebraking ? (brakeSmoothed * 0.70f) : (brakeSmoothed * 0.20f);
+        float rearBrake  = activebraking ? (brakeSmoothed * 0.30f) : (brakeSmoothed * 0.80f);
         vehicle->setBrake(frontBrake, 0);
         vehicle->setBrake(frontBrake, 1);
         vehicle->setBrake(rearBrake,  2);
         vehicle->setBrake(rearBrake,  3);
+
+        // --- Velocity-proportional linear damping (Issue #1 supplement) ---
+        // Constant linear damping of 0.15 is too uniform: at high speed it barely
+        // resists, so all deceleration came from the (formerly raw) brake force.
+        // Now: damping ramps from 0.05 at highway speed to 0.35 at near-zero.
+        // This creates a natural "coast curve" — the car bleeds speed gradually
+        // even before the brakes fully engage, giving braking its proper inertia feel.
+        {
+            float speedNorm  = fminf(1.0f, absSpeedKmh / 80.0f);  // 0 at stop, 1 at 80+ km/h
+            float dynLinDamp = 0.35f * (1.0f - speedNorm) + 0.05f * speedNorm;  // 0.35→0.05
+            chassis->setDamping(dynLinDamp, P_ANGULAR_DAMP);
+        }
 
         // =====================================================================
         //  ARCADE DRIFT SYSTEM — research-based fake drift
@@ -641,8 +681,8 @@ int main()
 
         // 4. Weight Transfer (research: W_r decreases during braking)
         //    Braking shifts load forward → rear axle unloads → grip drops
-        //    Simplified: reduce rear friction proportional to brake input
-        float brakeNorm   = brakeForce / P_BRAKE_FORCE;
+        //    Now uses brakeSmoothed so weight transfer also ramps in/out smoothly.
+        float brakeNorm   = brakeSmoothed / P_BRAKE_FORCE;
         float weightShift = brakeNorm * P_WEIGHT_TRANSFER;
         float wtMult      = 1.0f - weightShift * 0.28f;  // max -28% rear grip on full brake
         vehicle->getWheelInfo(2).m_frictionSlip *= wtMult;
