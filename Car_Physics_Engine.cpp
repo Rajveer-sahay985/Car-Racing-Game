@@ -822,10 +822,25 @@ int main()
             float signedCarOmega = curSpeedKmh / 3.6f / P_WHEEL_RADIUS; // +fwd, -rev
             float extraOmega     = fmaxf(0.0f, rearSpinOmega - carOmegas);
 
-            float targetVel = (extraOmega > 1.5f) ? rearSpinOmega : signedCarOmega;
+            float targetVel;
+            float velRate;
 
-            // Fast only when lighting up burnout; gentle for all other transitions
-            float velRate = (extraOmega > 1.5f && targetVel > rearWheelVel) ? 14.0f : 3.5f;
+            if (extraOmega > 1.5f) {
+                // Burnout/drift: fast forward spin-up
+                targetVel = rearSpinOmega;
+                velRate   = 14.0f;
+            } else if (fabsf(curSpeedKmh) < 1.0f) {
+                // Near-stop zone: smoothly zero out regardless of previous direction
+                // Prevents S-release snap: rearWheelVel was negative, car nearly stopped,
+                // target=0 reached at 10/s → wheels just stop, no forward flip
+                targetVel = 0.0f;
+                velRate   = 10.0f;
+            } else {
+                // Normal rolling: gently follow signed car speed
+                targetVel = signedCarOmega;
+                velRate   = 3.5f;
+            }
+
             rearWheelVel += (targetVel - rearWheelVel) * velRate * dt;
 
             rearWheelSpin += rearWheelVel * dt;  // always accumulate — no direct assign, no snap
