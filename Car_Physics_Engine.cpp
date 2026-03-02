@@ -558,9 +558,10 @@ int main()
             targetRearOmega = refOmega * (1.5f + (1.0f - launchT) * 3.0f);
             omegaUp = 14.0f; omegaDown = 0.8f;  // quick spin-up, VERy slow spin-down
         } else if (launching && !handbrake) {
-            // W only at low speed: moderate spin, still slow to grip up
-            targetRearOmega = refOmega * (0.5f + (1.0f - launchT) * 0.7f);
-            omegaUp = 8.0f; omegaDown = 1.2f;
+            // W only (no SPACE): normal rolling — wheels track car speed exactly
+            // No visual over-spin without SPACE; spinOffset stays at 0; no elastic snap
+            targetRearOmega = carOmegas;
+            omegaUp = 8.0f; omegaDown = 8.0f;
         } else if (isDrifting && throttleOn) {
             // Sustained drift: spin proportional to sideways angle
             targetRearOmega = carOmegas * (1.0f + driftRatio * 1.5f);
@@ -822,7 +823,7 @@ int main()
 
             float extraOmega = fmaxf(0.0f, rearSpinOmega - carOmegas); // EXCESS above rolling
 
-            if (extraOmega > 0.5f) {
+            if (extraOmega > 1.5f) {  // threshold: only genuine burnout/drift over-spin
                 // Burnout/drift: accumulate extra spin above the rolling base
                 spinOffset += extraOmega * dt;
             } else {
