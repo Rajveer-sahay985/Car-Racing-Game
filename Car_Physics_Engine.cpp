@@ -169,7 +169,15 @@ int main()
                                               //   higher = tighter/faster donut
 
     // --- Body Feel (visual dynamics) ---
-    const float P_BODY_ROLL       = 0.06f;   // lean amount in corners (rad per m/s lateral)
+    // Issue #2: P_BODY_ROLL is now applied WITHOUT a hidden *0.05f factor.
+    //   Old effective coefficient: 0.06 * 0.05 = 0.003 rad/(m/s) → ~1.7° at 8 m/s lateral.
+    //   New effective coefficient: 0.012 rad/(m/s)              → ~5.5° at 8 m/s lateral.
+    //   Clamped to ±0.18 rad (≈10°) so it never looks broken.
+    const float P_BODY_ROLL       = 0.012f;  // lean amount in corners (rad per m/s lateral velocity)
+    // Issue #2: P_BODY_PITCH controls nose-dive (braking) and rear-squat (acceleration).
+    //   Suspension geometric pitch = (frontComp - rearComp) * suspLength / wheelBase * PITCH_SCALE
+    //   At 0.15 compression diff: 0.15 * 0.45 / 2.5 * 2.5 = 0.068 rad ≈ 3.9°
+    const float P_BODY_PITCH      = 2.5f;    // nose-dive / squat intensity (pitch scale factor)
     const float P_SUSP_BOB_SCALE  = 0.7f;   // suspension height bob multiplier
     const float P_VIB_AMP         = 0.003f;  // engine vibration amplitude
     const float P_VIB_FREQ        = 14.0f;   // engine vibration frequency (Hz)
@@ -1004,38 +1012,96 @@ int main()
                 }
 
                 // =====================================================================
-                //  BODY DYNAMICS: suspension bob + lateral roll + engine vibration
-                //  Reads actual per-wheel suspension compression from Bullet each frame.
+                //  BODY DYNAMICS — Issue #2: PER-WHEEL SUSPENSION + PITCH + ROLL
+                //
+                //  Two-layer system:
+                //   Physical layer:    per-wheel compression differential (what Bullet measured)
+                //   Perceptual layer:  G-force / force estimate (immediate visual response)
+                //  Blended and smoothed with static lerp vars to avoid per-frame jitter.
                 // =====================================================================
 
-                // 1. Average suspension compression across all 4 wheels
-                float avgSuspComp = 0.0f;
+                // --- Per-wheel suspension compression (0=extended, 1=compressed) ---
+                // Wheel layout:  FL=0 (left-front)  FR=1 (right-front)
+                //                RL=2 (left-rear)   RR=3 (right-rear)
+                float comp[4];
                 for (int wi = 0; wi < 4; wi++) {
                     vehicle->updateWheelTransform(wi, true);
                     const btWheelInfo& w = vehicle->getWheelInfo(wi);
-                    // compression ratio: 0 = fully extended, 1 = fully compressed
-                    float comp = 1.0f - (w.m_raycastInfo.m_suspensionLength / P_SUSP_LENGTH);
-                    if (comp < 0) comp = 0;
-                    avgSuspComp += comp;
+                    float c = 1.0f - (w.m_raycastInfo.m_suspensionLength / P_SUSP_LENGTH);
+                    comp[wi] = fmaxf(0.0f, fminf(1.0f, c));
                 }
-                avgSuspComp /= 4.0f;
+                float avgSuspComp = (comp[0] + comp[1] + comp[2] + comp[3]) * 0.25f;
                 float bodyBob = avgSuspComp * P_SUSP_BOB_SCALE * P_SUSP_LENGTH;
 
-                // 2. Engine vibration: scales with speed
+                // --- PITCH: Nose-dive (braking) and rear-squat (acceleration) ---
+                //
+                //  Physical: front suspension compresses more than rear under braking
+                //  (weight transfers forward = nose dives).
+                //  Rear compresses more under hard acceleration (rear settles = squat).
+                //
+                //  Geometric formula: pitch ≈ height_diff / wheelBase
+                //  height_diff = (frontAvg - rearAvg) * P_SUSP_LENGTH
+                //  Negative result = nose down (dive). Positive = nose up (squat).
+                float frontAvg   = (comp[0] + comp[1]) * 0.5f;   // FL + FR average
+                float rearAvg    = (comp[2] + comp[3]) * 0.5f;   // RL + RR average
+                float suspPitch  = -(frontAvg - rearAvg) * P_SUSP_LENGTH / wheelBase * P_BODY_PITCH;
+
+                //  Perceptual: brake/throttle force gives IMMEDIATE pitch feel before
+                //  suspension has time to build up compression (lag-compensation).
+                //  forcePitch is negative under braking (dive) and positive under acceleration (squat).
+                float forcePitch = -(brakeSmoothed  / P_BRAKE_FORCE) * 0.07f;
+                forcePitch      += (throttleOn ? (fabsf(engineSmoothed) / P_ENGINE_FORCE) : 0.0f) * 0.045f;
+
+                // Blend: 50% perceptual (snappy) + 50% physical (confirmed)
+                // Negated: MatrixRotateX convention has opposite sign to what nose-dive implies.
+                float rawPitch = -(forcePitch * 0.50f + suspPitch * 0.50f);
+
+                // --- ROLL: Lean into corners ---
+                //
+                //  Physical: right wheels compressed more than left → body leans RIGHT.
+                //  leftAvg > rightAvg → left-side lower → lean LEFT (negative Z rotation).
+                //  Sign: (leftAvg - rightAvg) is negative when turning left (right compressed)
+                //  which matches gRoll being negative when turning left — both correct ✓
+                float leftAvg   = (comp[0] + comp[2]) * 0.5f;   // FL + RL average
+                float rightAvg  = (comp[1] + comp[3]) * 0.5f;   // FR + RR average
+                float suspRoll  = (leftAvg - rightAvg) * P_SUSP_LENGTH / trackWidth * 2.2f;
+
+                //  Perceptual: lateral velocity gives immediate roll — matches existing formula
+                //  but with correct coefficient (no hidden *0.05 factor).
+                //  latSpd > 0 (sliding right / turning left) → negative Z → lean right ✓
+                float gRoll = -latSpd * P_BODY_ROLL;
+                if (gRoll >  0.18f) gRoll =  0.18f;
+                if (gRoll < -0.18f) gRoll = -0.18f;
+
+                // Blend: 65% G-force (snappy) + 35% suspension (physical confirmation)
+                float rawRoll = gRoll * 0.65f + suspRoll * 0.35f;
+
+                // --- Smooth pitch and roll across frames (static = persists per frame) ---
+                //  Without smoothing, Bullet's per-substep suspension variance causes
+                //  visible jitter in the body angle. Lerp rate:
+                //    9/s for roll  → ~0.11s response  (snappy corners)
+                //    7/s for pitch → ~0.14s response  (slightly slower = weight feels heavy)
+                static float bodyRoll  = 0.0f;
+                static float bodyPitch = 0.0f;
+                bodyRoll  += (rawRoll  - bodyRoll)  * 9.0f * dt;
+                bodyPitch += (rawPitch - bodyPitch) * 7.0f * dt;
+
+                // --- Engine vibration: scales with speed ---
                 float vibration = P_VIB_AMP
                     * (fabsf(curSpeedKmh) / 80.0f)
                     * sinf((float)GetTime() * P_VIB_FREQ * 6.2832f);
 
-                // 3. Body roll: lean into corners based on lateral g-force
-                //    Clamped to ±10° so it never looks broken
-                float bodyRoll = -latSpd * P_BODY_ROLL * 0.05f;
-                if (bodyRoll >  0.17f) bodyRoll =  0.17f;
-                if (bodyRoll < -0.17f) bodyRoll = -0.17f;
-
-                // Build car matrix: roll → yaw → translate
+                // Build car matrix: pitch(X) → roll(Z) → yaw(Y) → translate
+                // MatrixRotateX(bodyPitch): nose dives (negative) or squats (positive)
+                // MatrixRotateZ(bodyRoll):  leans into corners
+                // MatrixRotateY(heading):   world-space yaw
+                // Applied innermost-first: pitch in car-local space, then roll, then yaw.
                 Matrix carMat = MatrixMultiply(
                     MatrixMultiply(
-                        MatrixRotateZ(bodyRoll),
+                        MatrixMultiply(
+                            MatrixRotateX(bodyPitch),
+                            MatrixRotateZ(bodyRoll)
+                        ),
                         MatrixRotateY(heading)
                     ),
                     MatrixTranslate(carPos.x, bodyBob + vibration, carPos.z)
