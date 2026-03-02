@@ -143,6 +143,9 @@ int main()
     const float P_WEIGHT_TRANSFER  = 0.7f;   // braking rear-unload fraction (0-1)
     const float P_DRIFT_ANGLE_ENTRY= 8.0f;   // slip angle (°) to enter drift state
     const float P_DRIFT_ANGLE_EXIT = 4.0f;   // slip angle (°) to exit drift state
+    const float P_DRIFT_POWER_FORCE= 2200.0f;// power oversteer: extra forward force during drift
+                                              //   simulates rear wheels pushing car along heading
+                                              //   higher = bigger arcs, more aggressive slide
 
     // --- RWD Launch / Wheel Spin ---
     const float P_LAUNCH_SPIN_FRIC = 0.18f;  // rear friction at ZERO speed (full wheel spin)
@@ -370,8 +373,9 @@ int main()
     {
         float dt = GetFrameTime();
         if (dt > 0.05f) dt = 0.05f;   // safety clamp
-        bool  launching = false;       // set in launch section, read in readback
-        float launchT   = 1.0f;
+        bool  launching   = false;     // set in launch section, read in readback
+        float launchT     = 1.0f;
+        bool  throttleOn  = false;     // W held going forward — hoisted for drift section
 
         // =====================================================================
         //  STEP 3: INPUT SMOOTHING + SPEED-SENSITIVE STEERING
@@ -562,6 +566,20 @@ int main()
             }
         }
 
+        // 8. Power Oversteer — rear wheels push car along heading during drift
+        //
+        //  Reality: when rear tires slip, they spin rapidly and push the car in
+        //  the direction the rear axle is FACING (car heading), not where car
+        //  travels. Steering angle makes front wheels form a pivot, so the combo
+        //  of heading-thrust + steered fronts = proper large-radius drift arc.
+        //
+        //  Force = throttle% × driftDepth × P_DRIFT_POWER_FORCE
+        //         applied along fwdWorld (car nose direction)
+        if (isDrifting && throttleOn && fabsf(engineSmoothed) > 50.0f) {
+            float throttleFraction = fabsf(engineSmoothed) / P_ENGINE_FORCE;   // 0-1
+            float powerForce       = throttleFraction * driftRatio * P_DRIFT_POWER_FORCE;
+            chassis->applyCentralForce(fwdWorld * powerForce);
+        }
 
         // =====================================================================
         //  RWD LAUNCH / WHEEL SPIN
@@ -571,7 +589,7 @@ int main()
         //   B) Bog force → backward impulse keeps car mostly in place during spin
         //   C) rearWheelSpin → visual spin driven by engine RPM (NOT car speed)
         // =====================================================================
-        bool        throttleOn    = IsKeyDown(KEY_W) && curSpeedKmh > -2.0f;
+        throttleOn    = IsKeyDown(KEY_W) && curSpeedKmh > -2.0f;
         static bool prevThrottle  = false;
         bool        freshThrottle = throttleOn && !prevThrottle && absSpeedKmh < 5.0f;
         prevThrottle = throttleOn;
@@ -679,14 +697,19 @@ int main()
         wheelSpin = (float)vehicle->getWheelInfo(2).m_rotation;  // front wheels
 
         // Rear visual spin
+        // Fast during both LAUNCH (wheel spin) and DRIFT (tires slipping sideways)
         if (launching) {
-            // During wheel spin: spin rate = full engine RPM equivalent (much faster than car)
-            // spinOmega = how fast wheel would spin if car was going P_LAUNCH_SPEED_KMH
-            float maxOmega    = (P_LAUNCH_SPEED_KMH / 3.6f) / P_WHEEL_RADIUS;  // rad/s at full speed
-            float spinOmega   = maxOmega * (1.5f + (1.0f - launchT) * 3.0f);   // 4.5x at rest, 1.5x at grip
-            rearWheelSpin    += spinOmega * dt;
+            float maxOmega  = (P_LAUNCH_SPEED_KMH / 3.6f) / P_WHEEL_RADIUS;
+            float spinOmega = maxOmega * (1.5f + (1.0f - launchT) * 3.0f);  // 4.5x at standstill
+            rearWheelSpin  += spinOmega * dt;
+        } else if (isDrifting && throttleOn) {
+            // During drift: rear tires slip laterally — also spin faster than car travel speed
+            // slipMult scales with drift depth: 0% drift = 1x, 100% = 2.5x speed
+            float carOmega  = totalSpd / P_WHEEL_RADIUS;             // what normal rolling would be
+            float slipMult  = 1.0f + driftRatio * 1.5f;              // 1x normal, 2.5x fully sideways
+            rearWheelSpin  += carOmega * slipMult * dt;
         } else {
-            // Normal driving: rear spin equals front spin
+            // Normal driving or coasting: rear matches Bullet's actual rotation
             rearWheelSpin = wheelSpin;
         }
 
