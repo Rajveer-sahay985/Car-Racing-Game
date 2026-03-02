@@ -793,12 +793,36 @@ int main()
         vehicle->updateWheelTransform(2, true);
         wheelSpin = (float)vehicle->getWheelInfo(2).m_rotation;  // front wheels
 
-        // Rear visual spin: directly driven by rearSpinOmega (synced with physics)
-        // This automatically shows fast spin during burnout and gradual slowdown on release
-        if (rearSpinOmega > carOmegas + 0.3f) {
-            rearWheelSpin += rearSpinOmega * dt;  // spinning faster than car speed
-        } else {
-            rearWheelSpin = wheelSpin;             // normal rolling — use Bullet's value
+        // Rear visual omega — smooth, direction-aware, no angle snapping
+        //
+        // Bug 1 fix (angle snap): previously switched between accumulate and direct
+        //   assign (= wheelSpin), causing the two different absolute-angle bases
+        //   to collide → instant 90-180° jump on deceleration. Fix: always accumulate,
+        //   use rearVisualOmega that smoothly interpolates between spin and rolling.
+        //
+        // Bug 2 fix (wrong direction on reverse): carOmegas = |speed|/radius always
+        //   positive. rollingOmega = carOmegas × carDir so it correctly goes negative
+        //   when reversing, making rear wheels roll backward like front wheels.
+        {
+            static float rearVisualOmega = 0.0f;
+
+            float carDir      = (curSpeedKmh > -0.1f) ? 1.0f : -1.0f; // +1 fwd, -1 rev
+            float rollingOmega = carOmegas * carDir;  // direction-aware rolling speed
+
+            float targetVisualOmega;
+            if (rearSpinOmega > carOmegas + 0.3f) {
+                // Over-spinning (burnout/drift): fast positive spin
+                targetVisualOmega = rearSpinOmega;
+            } else {
+                // Normal driving/braking/reverse: match actual car speed + direction
+                targetVisualOmega = rollingOmega;
+            }
+
+            // Smooth converge — eliminates snap on transition (rate: ~0.1s to settle)
+            rearVisualOmega += (targetVisualOmega - rearVisualOmega) * 10.0f * dt;
+
+            // Always accumulate. No direct = assignment. No angle snap.
+            rearWheelSpin += rearVisualOmega * dt;
         }
 
         // =====================================================================
