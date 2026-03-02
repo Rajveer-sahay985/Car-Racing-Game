@@ -130,15 +130,19 @@ int main()
     const float P_REAR_FRICTION   = 2.8f;    // rear wheel grip (normal)
 
     // --- Drift ---
-    const float P_HB_FRICTION     = 0.85f;   // rear grip during handbrake
-                                              //  lower = easier to slide (try 0.6-1.0)
-    const float P_DRIFT_SUSTAIN   = 2.4f;    // how fast grip drops while sliding
-                                              //  higher = slide sustains longer
-    const float P_DRIFT_MIN_FRIC  = 1.2f;    // minimum rear grip during sustained slide
-    const float P_MAX_YAW_RATE    = 10.0f;    // rad/s cap — MAIN anti-spinout dial
-                                              //  lower (1.5) = tighter control
-                                              //  higher (3.0) = wilder spins
-    const float P_COUNTERSTEER    = 6000.0f;  // countersteer assist strength
+    const float P_HB_FRICTION      = 0.85f;  // rear grip during handbrake (try 0.6-1.0)
+    const float P_DRIFT_SUSTAIN    = 2.4f;   // how fast grip drops while sliding
+    const float P_DRIFT_MIN_FRIC   = 1.2f;   // minimum rear grip during sustained slide
+    const float P_MAX_YAW_RATE     = 1.5f;   // rad/s cap — MAIN "tight circles" dial
+                                              //   1.0=very controlled, 2.5=wild spins
+    const float P_COUNTERSTEER     = 5000.0f;// countersteer torque assist
+
+    // --- Arcade Fake Drift (Research-Based) ---
+    const float P_DRIFT_MOMENTUM   = 0.55f;  // "imaginary wall" — resists lateral change
+                                              //   higher = longer arcs, less spinout
+    const float P_WEIGHT_TRANSFER  = 0.7f;   // braking rear-unload fraction (0-1)
+    const float P_DRIFT_ANGLE_ENTRY= 8.0f;   // slip angle (°) to enter drift state
+    const float P_DRIFT_ANGLE_EXIT = 4.0f;   // slip angle (°) to exit drift state
 
     // --- Body Feel (visual dynamics) ---
     const float P_BODY_ROLL       = 0.06f;   // lean amount in corners (rad per m/s lateral)
@@ -429,37 +433,56 @@ int main()
         vehicle->setBrake(brakeForce, 3);
 
         // =====================================================================
-        //  STEP 4: NFS-STYLE DRIFT / TRACTION
-        //
-        //  NFS drift secret: DON'T lock the rear wheels.
-        //  Just reduce rear friction so wheels spin freely with low grip.
-        //  Engine force through the spinning rear creates POWER OVERSTEER.
-        //  Throttle + steer + drift angle find a natural equilibrium — fun!
-        //
-        //  Old (bad):  friction=0.4 + MAX_BRAKE*4 → instant spinout
-        //  New (good): friction=0.85 + NO rear lock → controllable slide
+        //  ARCADE DRIFT SYSTEM — research-based fake drift
+        //  Methods: slip angle α, state machine, imaginary wall (momentum
+        //  preservation), weight transfer, vector dot-product scoring.
         // =====================================================================
 
-        // --- Read chassis velocity in local car space ---
+        // --- Velocity decomposition in car-local space ---
         btTransform driftTrans;
         chassis->getMotionState()->getWorldTransform(driftTrans);
         btVector3 vel        = chassis->getLinearVelocity();
-        btVector3 fwdWorld   = driftTrans.getBasis().getColumn(2);  // car's +Z
-        btVector3 rightWorld = driftTrans.getBasis().getColumn(0);  // car's +X
-        float     latSpd     = vel.dot(rightWorld);  // positive = sliding right
+        btVector3 fwdWorld   = driftTrans.getBasis().getColumn(2);  // car +Z
+        btVector3 rightWorld = driftTrans.getBasis().getColumn(0);  // car +X
+        float     fwdSpd     = vel.dot(fwdWorld);
+        float     latSpd     = vel.dot(rightWorld);  // +ve = sliding right
         float     totalSpd   = btSqrt(vel.x()*vel.x() + vel.z()*vel.z());
 
-        // Drift ratio: 0 = tracking straight, 1 = fully sideways
-        float driftRatio = (totalSpd > 1.0f) ? fabsf(latSpd) / totalSpd : 0.0f;
-        bool  isDrifting = driftRatio > 0.18f;
+        // 1. Slip angle α = atan2(lateral, forward) in degrees
+        //    0° = straight tracking, 45° = drifting, 90° = fully broadside
+        float slipAngle = (fabsf(fwdSpd) > 0.5f)
+            ? fabsf(atan2f(fabsf(latSpd), fabsf(fwdSpd))) * RAD2DEG
+            : 0.0f;
 
-        // --- Handbrake (Space) ---
+        // 2. Drift score via vector dot product (research formula)
+        //    score = 1 - |velDir · carFwd|
+        //    0 = perfect tracking, 1 = fully sideways
+        btVector3 velDir   = (totalSpd > 0.5f) ? vel / totalSpd : fwdWorld;
+        float     driftScore = 1.0f - fabsf(velDir.dot(fwdWorld));
+
+        // Keep driftRatio for friction modulation (0-1 sideways fraction)
+        float driftRatio = (totalSpd > 1.0f) ? fabsf(latSpd) / totalSpd : 0.0f;
+
+        // 3. Drift state machine with hysteresis
+        //    Entry: α > P_DRIFT_ANGLE_ENTRY (default 8°)
+        //    Exit:  α < P_DRIFT_ANGLE_EXIT  (default 4°) after hold timer
+        //    Hysteresis prevents rapid mode flicker at the boundary.
+        static bool  driftActive    = false;
+        static float driftHoldTimer = 0.0f;
+        if (slipAngle > P_DRIFT_ANGLE_ENTRY && totalSpd > 5.0f) {
+            driftActive    = true;
+            driftHoldTimer = 0.3f;   // hold for 300ms
+        } else {
+            driftHoldTimer -= dt;
+            if (driftHoldTimer <= 0.0f && slipAngle < P_DRIFT_ANGLE_EXIT)
+                driftActive = false;
+        }
+        bool isDrifting = driftActive;
+
+        // --- Handbrake ---
         bool handbrake = IsKeyDown(KEY_SPACE);
 
-        // --- Dynamic rear friction (NFS sweet spot) ---
-        //  Normal grip  = 2.8
-        //  Handbrake    = 0.85  ← high enough to steer, low enough to slide
-        //  Sustain slide = 1.4-2.0 so the drift keeps going after handbrake release
+        // --- Dynamic rear friction ---
         float targetRearFriction;
         if (handbrake) {
             targetRearFriction = P_HB_FRICTION;
@@ -471,44 +494,50 @@ int main()
         }
 
         static float rearFriction = P_REAR_FRICTION;
-        float frictionRate = handbrake ? 18.0f : 6.0f;  // fast in, slow out
+        float frictionRate = handbrake ? 18.0f : 6.0f;
         rearFriction += (targetRearFriction - rearFriction) * frictionRate * dt;
         vehicle->getWheelInfo(2).m_frictionSlip = rearFriction;
         vehicle->getWheelInfo(3).m_frictionSlip = rearFriction;
 
-        // Handbrake: light FRONT brake only (weight transfer feel).
-        // Rear wheels are NOT braked — they spin freely with low friction.
-        // Engine force through spinning rear = power oversteer, not spinout.
+        // Handbrake: light front brake only (weight-transfer feel, NOT rear lock)
         if (handbrake) {
-            vehicle->setBrake(MAX_BRAKE * 0.6f, 0);   // front-left light brake
-            vehicle->setBrake(MAX_BRAKE * 0.6f, 1);   // front-right light brake
-            // rear wheels: no extra brake (already set to brakeForce above)
+            vehicle->setBrake(MAX_BRAKE * 0.6f, 0);
+            vehicle->setBrake(MAX_BRAKE * 0.6f, 1);
         }
 
-        // --- Yaw rate cap: prevents the "instant 180°" spinout ---
-        // Cap angular velocity around Y to ~115°/sec (2.0 rad/s).
-        // This is the invisible hand that makes NFS feel controllable.
+        // 4. Weight Transfer (research: W_r decreases during braking)
+        //    Braking shifts load forward → rear axle unloads → grip drops
+        //    Simplified: reduce rear friction proportional to brake input
+        float brakeNorm   = brakeForce / P_BRAKE_FORCE;
+        float weightShift = brakeNorm * P_WEIGHT_TRANSFER;
+        float wtMult      = 1.0f - weightShift * 0.28f;  // max -28% rear grip on full brake
+        vehicle->getWheelInfo(2).m_frictionSlip *= wtMult;
+        vehicle->getWheelInfo(3).m_frictionSlip *= wtMult;
+
+        // 5. Imaginary Wall — momentum preservation
+        //    Resists rapid lateral velocity CHANGES so the car sweeps a large
+        //    arc (stadium-style drift) instead of spinning in tight circles.
+        //    Force = -P_DRIFT_MOMENTUM × m × latSpd² (opposes lateral accel)
+        if (isDrifting && totalSpd > 5.0f) {
+            float wallMag  = P_DRIFT_MOMENTUM * P_CHASSIS_MASS
+                             * latSpd * fabsf(latSpd) * 0.001f;
+            chassis->applyCentralForce(rightWorld * (-wallMag));
+        }
+
+        // 6. Yaw rate cap — the "invisible hand" that tames the spinout
         {
             btVector3 angVel = chassis->getAngularVelocity();
-            float yawRate = angVel.y();
-            const float MAX_YAW = P_MAX_YAW_RATE;
-            if (fabsf(yawRate) > MAX_YAW) {
-                float clamped = MAX_YAW * (yawRate > 0 ? 1.0f : -1.0f);
-                chassis->setAngularVelocity(
-                    btVector3(angVel.x(), clamped, angVel.z()));
+            float yawRate    = angVel.y();
+            if (fabsf(yawRate) > P_MAX_YAW_RATE) {
+                float clamped = P_MAX_YAW_RATE * (yawRate > 0 ? 1.0f : -1.0f);
+                chassis->setAngularVelocity(btVector3(angVel.x(), clamped, angVel.z()));
             }
         }
 
-        // --- Countersteer assist ---
-        // When drifting AND holding opposite steer, apply a subtle corrective
-        // torque to help the player catch the slide (NFS "drift assist").
+        // 7. Countersteer assist
         if (isDrifting && fabsf(steerSmoothed) > 0.05f) {
-            // latSpd > 0 = sliding right; steerSmoothed > 0 = turning left
-            // Countersteering = these have the SAME sign
             float steerDotSlide = steerSmoothed * latSpd;
-            if (steerDotSlide > 0.0f) {  // countersteering detected
-                float assistStrength = driftRatio * 800.0f * steerDotSlide;
-                // Torque that pushes yaw back toward straight
+            if (steerDotSlide > 0.0f) {
                 chassis->applyTorque(
                     btVector3(0, -latSpd * driftRatio * P_COUNTERSTEER, 0));
             }
@@ -691,17 +720,31 @@ int main()
             EndMode3D();
 
             // --- HUD ---
-            DrawText("Step 4: Drift / Traction", 10, 10, 18, WHITE);
-            DrawText(TextFormat("Speed      : %5.1f km/h",    fabsf(curSpeedKmh)),      10, 38, 16, GREEN);
-            DrawText(TextFormat("Steer      : %5.1f deg",     steerSmoothed * RAD2DEG), 10, 58, 16, YELLOW);
-            DrawText(TextFormat("Drift      : %3.0f%%  %s",
-                driftRatio * 100.0f,
-                isDrifting ? "<< DRIFTING >>" : ""),
-                10, 78, 16, isDrifting ? Color{255,80,30,255} : Color{160,160,160,255});
-            DrawText(TextFormat("RearFric   : %.2f  (2.8=grip, 0.4=slide)", rearFriction),
-                10, 98, 15, {180,180,255,255});
-            DrawText(IsKeyDown(KEY_SPACE) ? "HANDBRAKE  : ON" : "HANDBRAKE  : off",
-                10, 118, 15, IsKeyDown(KEY_SPACE) ? Color{255,50,50,255} : Color{120,120,120,255});
+            DrawText("Arcade Drift Engine", 10, 10, 18, WHITE);
+            DrawText(TextFormat("Speed     : %5.1f km/h",  fabsf(curSpeedKmh)), 10, 36, 16, GREEN);
+
+            // Drift score bar (research: 1 - velDir.carFwd)
+            const char* scoreLabel = TextFormat("Drift Score: %3.0f%%", driftScore * 100.0f);
+            DrawText(scoreLabel, 10, 58, 16,
+                isDrifting ? Color{255,80,30,255} : Color{160,160,160,255});
+            // Draw score bar
+            DrawRectangle(160, 60, 120, 14, {40,40,40,200});
+            DrawRectangle(160, 60, (int)(driftScore * 120), 14,
+                isDrifting ? Color{255,80,30,220} : Color{100,200,100,180});
+
+            DrawText(TextFormat("Slip Angle: %5.1f deg  %s",
+                slipAngle,
+                isDrifting ? "<< DRIFT >>" : "grip"),
+                10, 78, 15,
+                isDrifting ? Color{255,160,30,255} : Color{140,140,140,255});
+
+            DrawText(TextFormat("Rear Grip : %.2f  HB=%s",
+                rearFriction, handbrake ? "ON" : "off"),
+                10, 98, 15,
+                handbrake ? Color{255,50,50,255} : Color{160,180,255,255});
+
+            DrawText("SPACE: Handbrake  |  R: Reset", 10, 118, 14, {150,150,150,255});
+
 
             int y = GetScreenHeight() - 90;
             DrawText("W/S  : Throttle / Brake+Reverse", 10, y,    15, {180,180,180,255});
