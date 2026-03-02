@@ -817,14 +817,17 @@ int main()
         //  W only → release:  rearWheelVel tracks signedCarOmega, both reach 0. No snap.
         //  S → release:       rearWheelVel was negative, gently returns to 0. No snap.
         {
-            static float rearWheelVel = 0.0f;
+            // wheelOmegaActual: signed omega derived from Bullet's own m_rotation delta
+            // m_rotation increases when rolling FORWARD, decreases when rolling BACKWARD.
+            // This is guaranteed correct regardless of car model orientation or curSpeedKmh sign.
+            // Front wheel (gripped, no over-spin) = ground-truth direction reference.
+            static float rearWheelVel  = 0.0f;
+            static float prevWheelSpin = 0.0f;
+            float deltaAngle       = wheelSpin - prevWheelSpin;
+            prevWheelSpin          = wheelSpin;
+            float wheelOmegaActual = (dt > 0.001f) ? (deltaAngle / dt) : 0.0f;
 
-            // fwdVel: chassis speed projected onto car's forward axis (m/s), CORRECTLY SIGNED
-            // Negative when reversing. curSpeedKmh from Bullet is always positive (magnitude only)
-            // so we CANNOT use it for signed omega — use dot product instead.
-            float fwdVel        = chassis->getLinearVelocity().dot(fwdWorld);  // m/s, signed
-            float signedCarOmega = fwdVel / P_WHEEL_RADIUS;                    // rad/s, signed
-            float extraOmega    = fmaxf(0.0f, rearSpinOmega - carOmegas);
+            float extraOmega = fmaxf(0.0f, rearSpinOmega - carOmegas);
 
             float targetVel;
             float velRate;
@@ -833,18 +836,17 @@ int main()
                 // Burnout/drift: fast forward spin-up
                 targetVel = rearSpinOmega;
                 velRate   = 14.0f;
-            } else if (fabsf(fwdVel) < 0.28f) {  // 0.28 m/s ≈ 1 km/h
-                // Near-stop zone: smoothly zero out regardless of previous direction
+            } else if (fabsf(wheelOmegaActual) < 0.3f) {  // near-stop: front wheel barely moving
                 targetVel = 0.0f;
                 velRate   = 10.0f;
             } else {
-                // Normal rolling: follow actual signed velocity (+fwd, -rev)
-                targetVel = signedCarOmega;
-                velRate   = 3.5f;
+                // Normal rolling: match front wheel's actual signed angular velocity
+                // Reverse (S): front wheel delta < 0 → targetVel negative → rear rolls backward ✓
+                targetVel = wheelOmegaActual;
+                velRate   = 5.0f;
             }
 
             rearWheelVel += (targetVel - rearWheelVel) * velRate * dt;
-
             rearWheelSpin += rearWheelVel * dt;  // always accumulate — no snap
         }
 
