@@ -640,56 +640,57 @@ int main()
             chassis->applyTorqueImpulse(btVector3(0, kickDir * P_LAUNCH_KICK, 0));
         }
 
-        // A) Friction ramp: P_LAUNCH_SPIN_FRIC at rest → full grip at launch speed
-        //    Quadratic curve: very slow grip build at first, snaps at end
+        // A) Friction ramp
+        //    With SPACE:    0.18 base → extreme wheel spin (donut/burnout)
+        //    Without SPACE: 0.55 base → moderate slip, car still moves forward naturally
         if (launching) {
-            float launchFric = P_LAUNCH_SPIN_FRIC
-                               + (P_REAR_FRICTION - P_LAUNCH_SPIN_FRIC) * (launchT * launchT);
+            float baseFric   = handbrake ? P_LAUNCH_SPIN_FRIC : 0.55f;
+            float launchFric = baseFric + (P_REAR_FRICTION - baseFric) * (launchT * launchT);
             vehicle->getWheelInfo(2).m_frictionSlip = launchFric;
             vehicle->getWheelInfo(3).m_frictionSlip = launchFric;
         }
 
-        // B) Bog force: backward force while wheels spin in place (straight burnout)
-        //    Keeps car MOSTLY in place during a straight burnout.
-        //    CRITICAL: scale by steering input:
-        //      No steer  (A/D = 0) → full bog → car stays in place, rear burns rubber
-        //      Full steer (A or D)  → bog = 0  → rear thrust pushes car → DONUT / circle
-        //    Without this, bog force (1800N) > rear traction limit (~1588N) and car can't rotate.
-        if (launching) {
-            // steerScale: 1 = straight, 0 = full lock → donut enabled at full steer
+        // B) Bog force: only when handbrake held + tires spinning
+        //    Without SPACE: car should move forward freely when steering
+        //    With SPACE: bog keeps car in place during straight burnout
+        if (launching && handbrake) {
             float steerFraction = fabsf(steerSmoothed) / (P_MAX_STEER * 0.6f);
             if (steerFraction > 1.0f) steerFraction = 1.0f;
-            float bogScale = 1.0f - steerFraction;           // 1 = no steer, 0 = full steer
+            float bogScale = 1.0f - steerFraction;
             float bogMag   = P_LAUNCH_BOG_FORCE * (1.0f - launchT) * bogScale;
             chassis->applyCentralForce(fwdWorld * (-bogMag));
         }
 
         // C) UNIVERSAL ARCADE LATERAL FORCE — W + steer at ANY state/speed
-        //    Always active when throttle + steer, regardless of SPACE.
-        //    SPACE only controls friction/braking — this force is independent.
-        //    → Releasing SPACE mid-donut: force stays ON, car continues arcing naturally.
+        //    SPACE + steer → full donut force
+        //    No SPACE, low speed → 45% force (car arcs gently, moves forward)
+        //    No SPACE, high speed → tapers further with speed
         //
-        //    With SPACE (handbrake): full force — donut/drift entry at any speed
-        //    Without SPACE (normal): tapers with speed — subtle arc assist, not a spin
-        //
-        //    W + A: steerNorm > 0 → donutMag < 0 → rear pushed LEFT → car arcs LEFT
-        //    W + D: steerNorm < 0 → donutMag > 0 → rear pushed RIGHT → car arcs RIGHT
+        //    FORCE DIRECTION: blended lateral + forward component
+        //    Pure sideways (90°) = spinning in circles (bad)
+        //    Diagonal (≈68° from forward) = rear pushed forward AND sideways = natural arc
+        //    Blend: 100% lateral + 40% forward = car moves forward while arcing
         if (throttleOn && fabsf(steerSmoothed) > 0.05f) {
             float steerNorm    = steerSmoothed / P_MAX_STEER;           // -1 to +1
             float throttleFrac = fabsf(engineSmoothed) / P_ENGINE_FORCE; // 0-1
 
-            // Speed taper: without SPACE, scale force down at high speed
-            // so normal W+steer driving doesn't feel weird at 100 km/h
-            float speedScale = handbrake
-                ? 1.0f                                      // SPACE held: always full
-                : 1.0f / (1.0f + absSpeedKmh * 0.04f);    // no SPACE: taper with speed
-                                                            // 1.0 at 0, 0.5 at 25, 0.25 at 75
+            float speedScale;
+            if (handbrake) {
+                speedScale = 1.0f;                              // SPACE: full force always
+            } else if (absSpeedKmh < P_HB_SPEED_THRESH) {
+                speedScale = 0.45f;                             // no SPACE, low speed: 45%
+            } else {
+                speedScale = 1.0f / (1.0f + absSpeedKmh * 0.04f); // no SPACE, high: taper
+            }
 
-            float donutMag = -steerNorm * throttleFrac * P_DONUT_FORCE * speedScale;
+            float lateral  = -steerNorm * throttleFrac * P_DONUT_FORCE * speedScale;
+            float forward  = fabsf(lateral) * 0.40f;           // 40% forward = arc feel
 
-            // Apply at rear (1.3m behind center): creates torque + translation together
+            // Diagonal force at rear: lateral (sideways) + forward component
+            // Result: rear steps out sideways AND car keeps moving forward → natural arc
+            btVector3 slideForce = rightWorld * lateral + fwdWorld * forward;
             btVector3 rearRelPos = fwdWorld * (-1.3f);
-            chassis->applyForce(rightWorld * donutMag, rearRelPos);
+            chassis->applyForce(slideForce, rearRelPos);
         }
 
 
