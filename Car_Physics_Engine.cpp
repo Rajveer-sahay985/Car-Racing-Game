@@ -158,6 +158,10 @@ int main()
     const float P_LAUNCH_KICK      = 900.0f; // torque impulse on fresh throttle (N·m·s)
     const float P_LAUNCH_BOG_FORCE = 1800.0f;// backward force during wheel spin (N)
                                               //   keeps car in place while tires heat up
+    const float P_DONUT_FORCE      = 3200.0f;// fake lateral rear force for donuts (N)
+                                              //   W+SPACE+A→rear pushed right→car spins left
+                                              //   W+SPACE+D→rear pushed left→car spins right
+                                              //   higher = tighter/faster donut
 
     // --- Body Feel (visual dynamics) ---
     const float P_BODY_ROLL       = 0.06f;   // lean amount in corners (rad per m/s lateral)
@@ -658,6 +662,27 @@ int main()
             float bogScale = 1.0f - steerFraction;           // 1 = no steer, 0 = full steer
             float bogMag   = P_LAUNCH_BOG_FORCE * (1.0f - launchT) * bogScale;
             chassis->applyCentralForce(fwdWorld * (-bogMag));
+        }
+
+        // C) FAKE DONUT / LATERAL SPIN FORCE
+        //    W + SPACE + A/D at ANY speed: rear of car pushed opposite to steer direction.
+        //    Applying at the REAR (not center) gives both:
+        //      - Translation: car slides laterally
+        //      - Torque: car rotates around front axle pivot
+        //    Result: smooth donut spin at low speed, aggressive arc entry at high speed.
+        //
+        //    W + A + SPACE: steerSmoothed > 0 → donutMag > 0 → rear pushed +rightWorld
+        //                   rear goes right, front pivots left → car spins LEFT
+        //    W + D + SPACE: steerSmoothed < 0 → donutMag < 0 → rear pushed -rightWorld
+        //                   rear goes left, front pivots right → car spins RIGHT
+        if (handbrake && throttleOn && fabsf(steerSmoothed) > 0.05f) {
+            float steerNorm    = steerSmoothed / P_MAX_STEER;          // -1 to +1
+            float throttleFrac = fabsf(engineSmoothed) / P_ENGINE_FORCE; // 0-1
+            float donutMag     = steerNorm * throttleFrac * P_DONUT_FORCE;
+
+            // Apply at rear of car: fwdWorld * -1.3m puts the force behind center of mass
+            btVector3 rearRelPos = fwdWorld * (-1.3f);  // world-space offset to rear
+            chassis->applyForce(rightWorld * donutMag, rearRelPos);
         }
 
         // =====================================================================
