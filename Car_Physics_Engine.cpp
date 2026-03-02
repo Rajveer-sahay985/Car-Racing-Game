@@ -645,12 +645,18 @@ int main()
             vehicle->getWheelInfo(3).m_frictionSlip = launchFric;
         }
 
-        // B) Bog force: backward central force while wheels spin
-        //    Keeps car mostly in place during burnout. Decays as speed builds.
-        //    bogForce goes: full at 0 km/h → zero at P_LAUNCH_SPEED_KMH
+        // B) Bog force: backward force while wheels spin in place (straight burnout)
+        //    Keeps car MOSTLY in place during a straight burnout.
+        //    CRITICAL: scale by steering input:
+        //      No steer  (A/D = 0) → full bog → car stays in place, rear burns rubber
+        //      Full steer (A or D)  → bog = 0  → rear thrust pushes car → DONUT / circle
+        //    Without this, bog force (1800N) > rear traction limit (~1588N) and car can't rotate.
         if (launching) {
-            float bogMag = P_LAUNCH_BOG_FORCE * (1.0f - launchT);  // linear decay
-            // Apply opposite to car's forward direction
+            // steerScale: 1 = straight, 0 = full lock → donut enabled at full steer
+            float steerFraction = fabsf(steerSmoothed) / (P_MAX_STEER * 0.6f);
+            if (steerFraction > 1.0f) steerFraction = 1.0f;
+            float bogScale = 1.0f - steerFraction;           // 1 = no steer, 0 = full steer
+            float bogMag   = P_LAUNCH_BOG_FORCE * (1.0f - launchT) * bogScale;
             chassis->applyCentralForce(fwdWorld * (-bogMag));
         }
 
