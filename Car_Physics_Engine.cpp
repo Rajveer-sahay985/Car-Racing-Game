@@ -664,26 +664,34 @@ int main()
             chassis->applyCentralForce(fwdWorld * (-bogMag));
         }
 
-        // C) FAKE DONUT / LATERAL SPIN FORCE
-        //    W + SPACE + A/D at ANY speed: rear of car pushed opposite to steer direction.
-        //    Applying at the REAR (not center) gives both:
-        //      - Translation: car slides laterally
-        //      - Torque: car rotates around front axle pivot
-        //    Result: smooth donut spin at low speed, aggressive arc entry at high speed.
+        // C) UNIVERSAL ARCADE LATERAL FORCE — W + steer at ANY state/speed
+        //    Always active when throttle + steer, regardless of SPACE.
+        //    SPACE only controls friction/braking — this force is independent.
+        //    → Releasing SPACE mid-donut: force stays ON, car continues arcing naturally.
         //
-        //    W + A + SPACE: steerSmoothed > 0 → donutMag > 0 → rear pushed +rightWorld
-        //                   rear goes right, front pivots left → car spins LEFT
-        //    W + D + SPACE: steerSmoothed < 0 → donutMag < 0 → rear pushed -rightWorld
-        //                   rear goes left, front pivots right → car spins RIGHT
-        if (handbrake && throttleOn && fabsf(steerSmoothed) > 0.05f) {
-            float steerNorm    = steerSmoothed / P_MAX_STEER;          // -1 to +1
+        //    With SPACE (handbrake): full force — donut/drift entry at any speed
+        //    Without SPACE (normal): tapers with speed — subtle arc assist, not a spin
+        //
+        //    W + A: steerNorm > 0 → donutMag < 0 → rear pushed LEFT → car arcs LEFT
+        //    W + D: steerNorm < 0 → donutMag > 0 → rear pushed RIGHT → car arcs RIGHT
+        if (throttleOn && fabsf(steerSmoothed) > 0.05f) {
+            float steerNorm    = steerSmoothed / P_MAX_STEER;           // -1 to +1
             float throttleFrac = fabsf(engineSmoothed) / P_ENGINE_FORCE; // 0-1
-            float donutMag     = -steerNorm * throttleFrac * P_DONUT_FORCE;
 
-            // Apply at rear of car: fwdWorld * -1.3m puts the force behind center of mass
-            btVector3 rearRelPos = fwdWorld * (-1.3f);  // world-space offset to rear
+            // Speed taper: without SPACE, scale force down at high speed
+            // so normal W+steer driving doesn't feel weird at 100 km/h
+            float speedScale = handbrake
+                ? 1.0f                                      // SPACE held: always full
+                : 1.0f / (1.0f + absSpeedKmh * 0.04f);    // no SPACE: taper with speed
+                                                            // 1.0 at 0, 0.5 at 25, 0.25 at 75
+
+            float donutMag = -steerNorm * throttleFrac * P_DONUT_FORCE * speedScale;
+
+            // Apply at rear (1.3m behind center): creates torque + translation together
+            btVector3 rearRelPos = fwdWorld * (-1.3f);
             chassis->applyForce(rightWorld * donutMag, rearRelPos);
         }
+
 
         // =====================================================================
         //  R KEY: RESET CAR UPRIGHT
