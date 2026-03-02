@@ -524,22 +524,64 @@ int main()
         bool highSpdHB = handbrake && absSpeedKmh > P_HB_SPEED_THRESH;
         bool lowSpdHB  = handbrake && absSpeedKmh <= P_HB_SPEED_THRESH;
 
-        // --- Dynamic rear friction (speed-dependent handbrake) ---
-        float targetRearFriction;
+        // ── Compute throttleOn / launching BEFORE spin-omega model ──────────
+        // (These were hoisted as false at loop top; set their real values here
+        //  so the spin-omega model below can use them correctly.)
+        throttleOn = IsKeyDown(KEY_W) && curSpeedKmh > -2.0f;
+        launching  = throttleOn && absSpeedKmh < P_LAUNCH_SPEED_KMH
+                     && !highSpdHB && !isDrifting;
+        launchT    = launching ? (absSpeedKmh / P_LAUNCH_SPEED_KMH) : 1.0f;
+
+        // ─────────────────────────────────────────────────────────────────────
+        //  SPIN-OMEGA FRICTION MODEL — replaces all separate friction lerps
+        //  rearSpinOmega = actual rear wheel angular velocity (rad/s)
+        //  carOmega      = what wheels SHOULD spin at for pure rolling contact
+        //  slip          = rearSpinOmega - carOmega  (excess spin)
+        //  slipRatio     = slip / refOmega  (0=grip, 1=full spin)
+        //  friction      = linear interp P_REAR_FRICTION↔P_LAUNCH_SPIN_FRIC
+        //
+        //  KEY PROPERTY: omega decays slow (inertia) so releasing SPACE causes
+        //  gradual 1-2s friction recovery, not an instant snap back to grip.
+        // ─────────────────────────────────────────────────────────────────────
+        static float rearSpinOmega = 0.0f;  // persists between frames
+        static float rearFriction  = P_REAR_FRICTION;
+        float carOmegas = (totalSpd > 0.1f) ? (totalSpd / P_WHEEL_RADIUS) : 0.0f;
+        float refOmega  = (P_LAUNCH_SPEED_KMH / 3.6f) / P_WHEEL_RADIUS;  // reference max spin
+
+        float targetRearOmega, omegaUp, omegaDown;
         if (highSpdHB) {
-            targetRearFriction = P_HB_HIGH_SPD_FRIC; // very low → big slide at speed
-        } else if (lowSpdHB) {
-            targetRearFriction = P_HB_FRICTION;       // moderate → controlled at launch
-        } else if (isDrifting) {
-            targetRearFriction = P_REAR_FRICTION - driftRatio * P_DRIFT_SUSTAIN;
-            if (targetRearFriction < P_DRIFT_MIN_FRIC) targetRearFriction = P_DRIFT_MIN_FRIC;
+            // Real handbrake: rear braked/locked → wheels decelerate
+            targetRearOmega = 0.0f;
+            omegaUp = 1.0f; omegaDown = 10.0f;  // fast stop
+        } else if (launching && handbrake) {
+            // W + SPACE burnout: max spin, very slow organic decay
+            targetRearOmega = refOmega * (1.5f + (1.0f - launchT) * 3.0f);
+            omegaUp = 14.0f; omegaDown = 0.8f;  // quick spin-up, VERy slow spin-down
+        } else if (launching && !handbrake) {
+            // W only at low speed: moderate spin, still slow to grip up
+            targetRearOmega = refOmega * (0.5f + (1.0f - launchT) * 0.7f);
+            omegaUp = 8.0f; omegaDown = 1.2f;
+        } else if (isDrifting && throttleOn) {
+            // Sustained drift: spin proportional to sideways angle
+            targetRearOmega = carOmegas * (1.0f + driftRatio * 1.5f);
+            omegaUp = 5.0f; omegaDown = 2.0f;
         } else {
-            targetRearFriction = P_REAR_FRICTION;
+            // No throttle (S pressed, coasting, car stopped):
+            // Decay quickly to car rolling speed — no reason to over-spin with no engine
+            targetRearOmega = carOmegas;
+            omegaUp = 3.0f; omegaDown = 8.0f;  // fast return to rolling; ~0.2s to stop
         }
 
-        static float rearFriction = P_REAR_FRICTION;
-        float frictionRate = handbrake ? 20.0f : 6.0f;
-        rearFriction += (targetRearFriction - rearFriction) * frictionRate * dt;
+        float omegaRate = (targetRearOmega > rearSpinOmega) ? omegaUp : omegaDown;
+        rearSpinOmega  += (targetRearOmega - rearSpinOmega) * omegaRate * dt;
+        if (rearSpinOmega < 0.0f) rearSpinOmega = 0.0f;
+
+        // Friction derived from slip ratio (physical relationship)
+        float slip      = fmaxf(0.0f, rearSpinOmega - carOmegas);  // excess spin
+        float slipRatio = fminf(1.0f, slip / (refOmega + 0.01f));  // 0=grip, 1=full slip
+        rearFriction    = P_REAR_FRICTION      * (1.0f - slipRatio)
+                        + P_LAUNCH_SPIN_FRIC   * slipRatio;
+
         vehicle->getWheelInfo(2).m_frictionSlip = rearFriction;
         vehicle->getWheelInfo(3).m_frictionSlip = rearFriction;
 
@@ -621,18 +663,10 @@ int main()
         //   B) Bog force → backward impulse keeps car mostly in place during spin
         //   C) rearWheelSpin → visual spin driven by engine RPM (NOT car speed)
         // =====================================================================
-        throttleOn    = IsKeyDown(KEY_W) && curSpeedKmh > -2.0f;
+        // throttleOn / launching / launchT computed above (before spin-omega model)
         static bool prevThrottle  = false;
         bool        freshThrottle = throttleOn && !prevThrottle && absSpeedKmh < 5.0f;
         prevThrottle = throttleOn;
-
-        // Is the car in the wheel-spin phase?
-        // Use !highSpdHB (not !handbrake) so low-speed SPACE still allows rear wheel spin.
-        // At low speed: SPACE = front brake only → rear should still spin freely.
-        // At high speed: SPACE = real rear lock → skip launch (rear handled separately).
-        launching = throttleOn && absSpeedKmh < P_LAUNCH_SPEED_KMH
-                    && !highSpdHB && !isDrifting;
-        launchT   = launching ? (absSpeedKmh / P_LAUNCH_SPEED_KMH) : 1.0f;
 
         // A) Torque-steer kick on fresh throttle
         if (freshThrottle) {
@@ -640,15 +674,7 @@ int main()
             chassis->applyTorqueImpulse(btVector3(0, kickDir * P_LAUNCH_KICK, 0));
         }
 
-        // A) Friction ramp
-        //    With SPACE:    0.18 base → extreme wheel spin (donut/burnout)
-        //    Without SPACE: 0.55 base → moderate slip, car still moves forward naturally
-        if (launching) {
-            float baseFric   = handbrake ? P_LAUNCH_SPIN_FRIC : 0.55f;
-            float launchFric = baseFric + (P_REAR_FRICTION - baseFric) * (launchT * launchT);
-            vehicle->getWheelInfo(2).m_frictionSlip = launchFric;
-            vehicle->getWheelInfo(3).m_frictionSlip = launchFric;
-        }
+        // Friction ramp handled by spin-omega model above (no separate override needed)
 
         // B) Bog force: only when handbrake held + tires spinning
         //    Without SPACE: car should move forward freely when steering
@@ -767,21 +793,12 @@ int main()
         vehicle->updateWheelTransform(2, true);
         wheelSpin = (float)vehicle->getWheelInfo(2).m_rotation;  // front wheels
 
-        // Rear visual spin
-        // Fast during both LAUNCH (wheel spin) and DRIFT (tires slipping sideways)
-        if (launching) {
-            float maxOmega  = (P_LAUNCH_SPEED_KMH / 3.6f) / P_WHEEL_RADIUS;
-            float spinOmega = maxOmega * (1.5f + (1.0f - launchT) * 3.0f);  // 4.5x at standstill
-            rearWheelSpin  += spinOmega * dt;
-        } else if (isDrifting && throttleOn) {
-            // During drift: rear tires slip laterally — also spin faster than car travel speed
-            // slipMult scales with drift depth: 0% drift = 1x, 100% = 2.5x speed
-            float carOmega  = totalSpd / P_WHEEL_RADIUS;             // what normal rolling would be
-            float slipMult  = 1.0f + driftRatio * 1.5f;              // 1x normal, 2.5x fully sideways
-            rearWheelSpin  += carOmega * slipMult * dt;
+        // Rear visual spin: directly driven by rearSpinOmega (synced with physics)
+        // This automatically shows fast spin during burnout and gradual slowdown on release
+        if (rearSpinOmega > carOmegas + 0.3f) {
+            rearWheelSpin += rearSpinOmega * dt;  // spinning faster than car speed
         } else {
-            // Normal driving or coasting: rear matches Bullet's actual rotation
-            rearWheelSpin = wheelSpin;
+            rearWheelSpin = wheelSpin;             // normal rolling — use Bullet's value
         }
 
         // =====================================================================
