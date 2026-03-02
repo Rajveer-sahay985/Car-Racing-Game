@@ -801,43 +801,39 @@ int main()
         vehicle->updateWheelTransform(2, true);
         wheelSpin = (float)vehicle->getWheelInfo(2).m_rotation;  // front wheels
 
-        // Rear visual omega — smooth, direction-aware, no angle snapping
+        // Rear visual spin — Bullet-base + burnout spin offset
         //
-        // Bug 1 fix (angle snap): previously switched between accumulate and direct
-        //   assign (= wheelSpin), causing the two different absolute-angle bases
-        //   to collide → instant 90-180° jump on deceleration. Fix: always accumulate,
-        //   use rearVisualOmega that smoothly interpolates between spin and rolling.
+        //  rearWheelSpin = wheelSpin (Bullet) + spinOffset
         //
-        // Bug 2 fix (wrong direction on reverse): carOmegas = |speed|/radius always
-        //   positive. rollingOmega = carOmegas × carDir so it correctly goes negative
-        //   when reversing, making rear wheels roll backward like front wheels.
+        //  wheelSpin  = vehicle->getWheelInfo(2).m_rotation
+        //             = Bullet's actual wheel rotation, perfectly synced with ground
+        //             = positive going forward, negative going backward
+        //             = exactly what front wheels use → both sets sync perfectly
+        //
+        //  spinOffset = accumulated EXTRA rotation during burnout ONLY
+        //             = 0 during normal driving/reverse/braking
+        //             = decays exponentially when burnout ends → no snap
+        //
+        //  Result: reverse = Bullet handles direction, offset=0 → correct backward roll
+        //          burnout = ground-synced base + visible over-spin on top
+        //          release = smooth fade, offset → 0, wheels return to normal sync
         {
-            static float rearVisualOmega = 0.0f;
+            static float spinOffset = 0.0f;
 
-            // carDir: +1 forward, -1 backward.
-            // Use ±0.8 km/h dead zone with hysteresis to prevent direction flip
-            // when car barely moves — avoids snap when releasing S while coasting.
-            float carDir;
-            if      (curSpeedKmh >  0.8f) carDir =  1.0f;  // clearly forward
-            else if (curSpeedKmh < -0.8f) carDir = -1.0f;  // clearly backward
-            else carDir = (rearVisualOmega >= 0.0f) ? 1.0f : -1.0f; // dead zone: keep current
+            float extraOmega = fmaxf(0.0f, rearSpinOmega - carOmegas); // EXCESS above rolling
 
-            float rollingOmega = carOmegas * carDir;  // direction-aware rolling speed
-
-            float targetVisualOmega;
-            if (rearSpinOmega > carOmegas + 0.3f) {
-                // Over-spinning (burnout/drift): fast positive spin
-                targetVisualOmega = rearSpinOmega;
+            if (extraOmega > 0.5f) {
+                // Burnout/drift: accumulate extra spin above the rolling base
+                spinOffset += extraOmega * dt;
             } else {
-                // Normal driving/braking/reverse: match actual car speed + direction
-                targetVisualOmega = rollingOmega;
+                // Normal driving, reverse, coasting: fade offset away
+                // Exponential decay — smooth, no snap
+                spinOffset += (0.0f - spinOffset) * 8.0f * dt;
+                if (fabsf(spinOffset) < 0.001f) spinOffset = 0.0f;
             }
 
-            // Smooth converge — eliminates snap on transition (rate: ~0.1s to settle)
-            rearVisualOmega += (targetVisualOmega - rearVisualOmega) * 10.0f * dt;
-
-            // Always accumulate. No direct = assignment. No angle snap.
-            rearWheelSpin += rearVisualOmega * dt;
+            // Bullet's rotation is the ground-truth base (handles all directions)
+            rearWheelSpin = wheelSpin + spinOffset;
         }
 
         // =====================================================================
