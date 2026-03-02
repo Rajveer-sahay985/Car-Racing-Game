@@ -145,11 +145,13 @@ int main()
     const float P_DRIFT_ANGLE_EXIT = 4.0f;   // slip angle (°) to exit drift state
 
     // --- RWD Launch / Wheel Spin ---
-    const float P_LAUNCH_SPIN_FRIC = 0.45f;  // rear friction at ZERO speed (full wheel spin)
-                                              //   lower = more spin, harder to control (try 0.3-0.6)
+    const float P_LAUNCH_SPIN_FRIC = 0.18f;  // rear friction at ZERO speed (full wheel spin)
+                                              //   MUST be < 0.68 to actually slip under 3000N
+                                              //   lower = more burnout, try 0.1-0.3
     const float P_LAUNCH_SPEED_KMH = 22.0f;  // speed at which grip fully recovers
     const float P_LAUNCH_KICK      = 900.0f; // torque impulse on fresh throttle (N·m·s)
-                                              //   gives the random left/right tail-kick
+    const float P_LAUNCH_BOG_FORCE = 1800.0f;// backward force during wheel spin (N)
+                                              //   keeps car in place while tires heat up
 
     // --- Body Feel (visual dynamics) ---
     const float P_BODY_ROLL       = 0.06f;   // lean amount in corners (rad per m/s lateral)
@@ -350,7 +352,8 @@ int main()
     // =========================================================================
     Vector3 carPos   = { 0, 0, 0 };
     float   heading  = 0.0f;    // yaw angle extracted from chassis matrix
-    float   wheelSpin= 0.0f;    // rolling angle from btWheelInfo::m_rotation
+    float   wheelSpin    = 0.0f;  // front wheels: from Bullet m_rotation
+    float   rearWheelSpin = 0.0f; // rear wheels: engine-RPM-driven (shows spin even at standstill)
 
     // =========================================================================
     //  CAMERA  (unchanged from Step 0)
@@ -367,6 +370,8 @@ int main()
     {
         float dt = GetFrameTime();
         if (dt > 0.05f) dt = 0.05f;   // safety clamp
+        bool  launching = false;       // set in launch section, read in readback
+        float launchT   = 1.0f;
 
         // =====================================================================
         //  STEP 3: INPUT SMOOTHING + SPEED-SENSITIVE STEERING
@@ -561,30 +566,43 @@ int main()
         // =====================================================================
         //  RWD LAUNCH / WHEEL SPIN
         //  Runs AFTER the drift friction system so it can override friction.
-        //  Below P_LAUNCH_SPEED_KMH:
-        //    - Rear tires start with very low grip (wheel spin)
-        //    - Grip ramps QUADRATICALLY as speed builds (slow then snaps)
-        //    - On fresh throttle press: random yaw impulse = torque steer kick
+        //  Three-part system:
+        //   A) Ultra-low friction (0.18) → rear tires actually SLIP in Bullet
+        //   B) Bog force → backward impulse keeps car mostly in place during spin
+        //   C) rearWheelSpin → visual spin driven by engine RPM (NOT car speed)
         // =====================================================================
         bool        throttleOn    = IsKeyDown(KEY_W) && curSpeedKmh > -2.0f;
         static bool prevThrottle  = false;
         bool        freshThrottle = throttleOn && !prevThrottle && absSpeedKmh < 5.0f;
         prevThrottle = throttleOn;
 
-        // Torque-steer kick: random left or right tail snap on launch
+        // Is the car in the wheel-spin phase?
+        launching = throttleOn && absSpeedKmh < P_LAUNCH_SPEED_KMH
+                    && !handbrake && !isDrifting;
+        launchT   = launching ? (absSpeedKmh / P_LAUNCH_SPEED_KMH) : 1.0f;
+
+        // A) Torque-steer kick on fresh throttle
         if (freshThrottle) {
             float kickDir = (GetRandomValue(0, 1) == 0) ? 1.0f : -1.0f;
             chassis->applyTorqueImpulse(btVector3(0, kickDir * P_LAUNCH_KICK, 0));
         }
 
-        // Friction ramp: 0.45 at rest → 2.8 at P_LAUNCH_SPEED_KMH
-        // Quadratic curve: grip comes in slowly at first then snaps (tyre warmup)
-        if (throttleOn && absSpeedKmh < P_LAUNCH_SPEED_KMH && !handbrake && !isDrifting) {
-            float t = absSpeedKmh / P_LAUNCH_SPEED_KMH;            // 0 → 1
+        // A) Friction ramp: P_LAUNCH_SPIN_FRIC at rest → full grip at launch speed
+        //    Quadratic curve: very slow grip build at first, snaps at end
+        if (launching) {
             float launchFric = P_LAUNCH_SPIN_FRIC
-                               + (P_REAR_FRICTION - P_LAUNCH_SPIN_FRIC) * (t * t);
+                               + (P_REAR_FRICTION - P_LAUNCH_SPIN_FRIC) * (launchT * launchT);
             vehicle->getWheelInfo(2).m_frictionSlip = launchFric;
             vehicle->getWheelInfo(3).m_frictionSlip = launchFric;
+        }
+
+        // B) Bog force: backward central force while wheels spin
+        //    Keeps car mostly in place during burnout. Decays as speed builds.
+        //    bogForce goes: full at 0 km/h → zero at P_LAUNCH_SPEED_KMH
+        if (launching) {
+            float bogMag = P_LAUNCH_BOG_FORCE * (1.0f - launchT);  // linear decay
+            // Apply opposite to car's forward direction
+            chassis->applyCentralForce(fwdWorld * (-bogMag));
         }
 
         // =====================================================================
@@ -653,10 +671,24 @@ int main()
         btVector3 fwdBt = chassisTrans.getBasis() * btVector3(0, 0, 1);
         heading = atan2f((float)fwdBt.x(), (float)fwdBt.z());
 
-        // Wheel spin: Bullet accumulates rotation per-wheel; use rear-left (2)
-        // m_rotation is in radians, accumulates over time — same as our old wheelSpin
+        // WheelSpin readback:
+        //  Front wheels: use Bullet's actual m_rotation (rolls with car speed)
+        //  Rear wheels:  custom accumulator driven by engine RPM so rear visually
+        //                spins fast even when the car is stationary (wheel spin phase)
         vehicle->updateWheelTransform(2, true);
-        wheelSpin = (float)vehicle->getWheelInfo(2).m_rotation;
+        wheelSpin = (float)vehicle->getWheelInfo(2).m_rotation;  // front wheels
+
+        // Rear visual spin
+        if (launching) {
+            // During wheel spin: spin rate = full engine RPM equivalent (much faster than car)
+            // spinOmega = how fast wheel would spin if car was going P_LAUNCH_SPEED_KMH
+            float maxOmega    = (P_LAUNCH_SPEED_KMH / 3.6f) / P_WHEEL_RADIUS;  // rad/s at full speed
+            float spinOmega   = maxOmega * (1.5f + (1.0f - launchT) * 3.0f);   // 4.5x at rest, 1.5x at grip
+            rearWheelSpin    += spinOmega * dt;
+        } else {
+            // Normal driving: rear spin equals front spin
+            rearWheelSpin = wheelSpin;
+        }
 
         // =====================================================================
         //  CAMERA  (unchanged from Step 0)
@@ -738,10 +770,11 @@ int main()
                     MatrixTranslate(carPos.x, bodyBob + vibration, carPos.z)
                 );
 
-                // --- Wheels (same matrix construction as Step 0) ---
+                // --- Wheels: front use wheelSpin (Bullet), rear use rearWheelSpin ---
                 for (int i = 0; i < 4; i++) {
                     bool front = (i < 2);
-                    Matrix m = MatrixRotateX(wheelSpin);
+                    // Front: Bullet's actual rotation | Rear: custom RPM-driven spin
+                    Matrix m = MatrixRotateX(front ? wheelSpin : rearWheelSpin);
                     if (front) m = MatrixMultiply(m, MatrixRotateY(steerSmoothed));
                     m = MatrixMultiply(m, MatrixTranslate(
                         wheelLocal[i].x, wheelLocal[i].y, wheelLocal[i].z));
