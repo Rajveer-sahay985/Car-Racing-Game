@@ -98,6 +98,100 @@ static const float CAR_PHYS_OFF_Z =  -0.1f;   // metres
 // =============================================================================
 
 // =============================================================================
+//  ★ VEHICLE WEIGHTS — affects suspension sag, grip loading, inertia ★
+// =============================================================================
+//  WHEEL_MASS     = mass of each tire (kg).  Heavier → more rotational inertia.
+static const float WHEEL_MASS      =  15.0f;   // kg  (try 8 – 25)
+
+//  CHASSIS_MASS   = mass of the invisible suspension frame (kg).
+static const float CHASSIS_MASS    =  80.0f;   // kg  (try 30 – 150)
+
+//  CAR_BODY_MASS  = mass of the visible car body (kg).  This is the dominant weight
+//                   that loads the suspension springs and increases tire grip.
+static const float CAR_BODY_MASS   = 700.0f;   // kg  (try 400 – 1000)
+//                   Total sprung mass per corner = (CHASSIS_MASS + CAR_BODY_MASS) / 4
+// =============================================================================
+
+// =============================================================================
+//  ★ ENGINE & DRIVETRAIN ★
+// =============================================================================
+//  DRIVE_TORQUE   = torque (Nm) applied to each rear wheel axle per physics step.
+//                   Higher → faster acceleration and more wheelspin at launch.
+//                   Lower  → sluggish acceleration, less wheelspin.
+static const float DRIVE_TORQUE    = 1050.0f;   // Nm  (try 200 – 1500)
+
+//  MAX_WHEEL_SPIN = angular velocity cap on driven wheels (rad/s).
+//                   Prevents wheels from spinning infinitely fast.
+//                   Lower  → lower top speed.  Higher → higher top speed.
+static const float MAX_WHEEL_SPIN  =  60.0f;   // rad/s  (try 10 – 60)
+
+//  MAX_STEER_ANGLE = maximum front-wheel steer angle (radians).
+//                    0.35 ≈ 20°, 0.55 ≈ 31°, 0.79 ≈ 45°
+static const float MAX_STEER_ANGLE =   0.55f;  // radians
+
+//  STEER_BLEND    = how quickly steering smoothly reaches MAX_STEER_ANGLE.
+//                   0.05 = very slow, lazy.   0.25 = snappy and responsive.
+//                   This is a per-frame lerp factor (applied at 60 fps).
+static const float STEER_BLEND     =   0.14f;  // 0.0 – 1.0
+
+//  STEER_SERVO_FORCE = max motor force of the front-wheel steering servo (N).
+//                      Higher → wheel snaps to target faster against friction.
+static const float STEER_SERVO_FORCE = 600.0f; // N  (try 300 – 2000)
+
+//  STEER_SERVO_SPEED = convergence speed of the steering servo (rad/s).
+//                      This is the velocity the servo motor tries to use.
+static const float STEER_SERVO_SPEED =   8.0f; // rad/s  (try 4 – 20)
+// =============================================================================
+
+// =============================================================================
+//  ★ TIRE PHYSICS — GRIP / TRACTION / DRIFT (Pacejka-inspired slip curve) ★
+//
+//  The friction coefficient of the driven rear wheels changes every frame
+//  based on how much the tire is slipping relative to the car’s ground speed.
+//  This produces realistic burnout, launch grip build-up, and controlled drift.
+//
+//  Slip ratio curve:
+//
+//   friction
+//     1.1 |        .....PEAK.....
+//         |      .·              ·.
+//    0.65 |    .·                  ·.
+//     0.4 |  .·                      ·.
+//    0.35 |.·                          ·--------- SPIN
+//         +----+-------+------------+------→ slip
+//             0%      15%          30%     100%
+// =============================================================================
+//  TIRE_SLIP_ONSET  = slip% at which peak grip is FIRST reached.
+//                     Lower → grip peaks immediately (grippy, hard to spin).
+//                     Higher → needs more wheelspin to build full grip.
+static const float TIRE_SLIP_ONSET =  0.15f;  // 0.0 – 0.30
+
+//  TIRE_SLIP_PEAK   = slip% where grip starts DROPPING (end of peak plateau).
+//                     Narrow window (ONSET → PEAK) = sharp peak, easy to overdrive.
+//                     Wide window                   = more forgiving driving.
+static const float TIRE_SLIP_PEAK  =  0.30f;  // 0.0 – 0.50
+
+//  TIRE_GRIP_IDLE   = friction at zero-slip (steady rolling, no acceleration).
+//                     This is the "grounded" baseline grip.
+static const float TIRE_GRIP_IDLE  =  0.65f;  // try 0.5 – 0.9
+
+//  TIRE_GRIP_PEAK   = maximum friction at optimal slip.
+//                     Higher → more grip, harder to break traction.
+//                     Lower  → less grip, easier to drift.
+static const float TIRE_GRIP_PEAK  =  1.05f;  // try 0.8 – 1.4
+
+//  TIRE_GRIP_SPIN   = friction when wheels are in full burnout spin or lockup.
+//                     Lower  → tyres barely grip at all = easy long burnouts.
+//                     Higher → tyres always partially grip = short burnouts.
+static const float TIRE_GRIP_SPIN  =  0.35f;  // try 0.15 – 0.65
+
+//  TIRE_FRONT_GRIP  = constant friction on the FRONT (non-driven) wheels.
+//                     High value → strong steering response.
+//                     Low value  → understeer / sliding nose.
+static const float TIRE_FRONT_GRIP =  1.00f;  // try 0.7 – 1.2
+// =============================================================================
+
+// =============================================================================
 //  BULLET WORLD
 // =============================================================================
 static btDefaultCollisionConfiguration*     gCollCfg    = nullptr;
@@ -427,7 +521,7 @@ static void BuildSuspension(const btVector3 wheelSpawns[4])
     // Invisible thin cross-frame spanning the wheel formation
     gChassisShape = new btBoxShape(btVector3(1.3f, 0.08f, 1.8f));
     btTransform t; t.setIdentity(); t.setOrigin(centre);
-    gChassisBody = MakeRigidBody(80.0f, t, gChassisShape);  // 80 kg frame
+    gChassisBody = MakeRigidBody(CHASSIS_MASS, t, gChassisShape);
     gChassisBody->setFriction(0.0f);
     gChassisBody->setDamping(0.08f, 0.30f);
 
@@ -471,8 +565,8 @@ static void BuildSuspension(const btVector3 wheelSpawns[4])
             // DOF index 4 = angular Y.  Servo drives it toward setServoTarget.
             s->enableMotor(4, true);
             s->setServo(4, true);
-            s->setMaxMotorForce(4, 600.0f);  // strong enough to steer against friction
-            s->setTargetVelocity(4, 8.0f);   // rad/s convergence speed
+            s->setMaxMotorForce(4, STEER_SERVO_FORCE);
+            s->setTargetVelocity(4, STEER_SERVO_SPEED);
             s->setServoTarget(4, 0.0f);      // start straight ahead
         } else {
             // REAR wheels: Y fully locked — they never steer
@@ -577,7 +671,7 @@ int main()
 
     btVector3 wheelSpawns[4];
     for (int i=0;i<4;i++) {
-        gWheels[i].mass=15.f; gWheels[i].friction=0.65f; gWheels[i].restitution=0.30f;
+        gWheels[i].mass=WHEEL_MASS; gWheels[i].friction=TIRE_GRIP_IDLE; gWheels[i].restitution=0.30f;
         gWheels[i].linDamp=0.12f; gWheels[i].angDamp=0.35f;
         gWheels[i].linDampHeld=0.20f; gWheels[i].angDampHeld=0.90f;
         gWheels[i].baseColor={30,30,35,255};   // dark rubber
@@ -612,7 +706,7 @@ int main()
     // into the chassis, compresses the suspension springs, and loads the tires.
     // Net sprung mass per tire spring: (80+700)/4 = 195 kg.
     {
-        gCarBody.mass=700.f; gCarBody.friction=0.40f; gCarBody.restitution=0.10f;
+        gCarBody.mass=CAR_BODY_MASS; gCarBody.friction=0.40f; gCarBody.restitution=0.10f;
         gCarBody.linDamp=0.05f; gCarBody.angDamp=0.20f;
         gCarBody.linDampHeld=0.15f; gCarBody.angDampHeld=0.90f;
         gCarBody.baseColor={55,65,75,255};  // dark steel
@@ -669,7 +763,7 @@ int main()
     // ── Picking state ─────────────────────────────────────────────────────────
     float moveSpeed=8.f;
     float steerAngle=0.f;               // current front-wheel steer angle (radians)
-    const float MAX_STEER=0.55f;        // ±55° max steer (≈31.5°)
+    const float MAX_STEER = MAX_STEER_ANGLE;  // from tuning block at top
     btPoint2PointConstraint* pickC=nullptr;
     PhysicsObj* pickedObj=nullptr;
     btVector3   pickPivot;
@@ -761,8 +855,7 @@ int main()
 
         // ── Drive rear wheels + steer front wheels (arrow keys) ──────────────
         {
-            const float DRIVE_TORQUE = 450.0f;
-            const float MAX_SPIN     =  20.0f;
+            // Torque and speed cap come from ENGINE & DRIVETRAIN block at top of file
 
             // Rear-wheel drive: angular torque on RL+RR axles
             float driveDir = 0.f;
@@ -773,7 +866,7 @@ int main()
                     btRigidBody* wb   = gWheels[wi].body;
                     btVector3    axle = wb->getWorldTransform().getBasis() * btVector3(1,0,0);
                     float currSpin    = (float)(wb->getAngularVelocity().dot(axle));
-                    if (fabsf(currSpin) < MAX_SPIN)
+                    if (fabsf(currSpin) < MAX_WHEEL_SPIN)
                         wb->applyTorqueImpulse(axle * (driveDir * DRIVE_TORQUE * dt));
                     wb->activate(true);
                 }
@@ -786,7 +879,7 @@ int main()
             float targetSteer = 0.f;
             if (IsKeyDown(KEY_LEFT))  targetSteer = -MAX_STEER;  // LEFT
             if (IsKeyDown(KEY_RIGHT)) targetSteer = +MAX_STEER;  // RIGHT
-            steerAngle += (targetSteer - steerAngle) * 0.14f;   // smooth blend
+            steerAngle += (targetSteer - steerAngle) * STEER_BLEND;   // smooth blend
             if (gSusp[0]) gSusp[0]->setServoTarget(4, steerAngle);
             if (gSusp[1]) gSusp[1]->setServoTarget(4, steerAngle);
         }
@@ -821,14 +914,15 @@ int main()
                     float denom = fmaxf(fmaxf(vCarAbs, vSpin), 0.30f);
                     float slip  = fminf(fabsf(vSpin - vCarAbs) / denom, 1.0f);
 
-                    if      (slip < 0.15f)  friction = 0.65f + (slip / 0.15f) * 0.40f;   // build
-                    else if (slip < 0.30f)  friction = 1.05f;                               // peak
-                    else                   { float t = (slip - 0.30f) / 0.70f;
-                                             friction = 1.05f - t * 0.70f; }               // drop
-                    friction = fmaxf(friction, 0.35f);
+                    float gripRange = TIRE_GRIP_PEAK - TIRE_GRIP_IDLE;
+                    if      (slip < TIRE_SLIP_ONSET)  friction = TIRE_GRIP_IDLE + (slip / TIRE_SLIP_ONSET) * gripRange;  // build
+                    else if (slip < TIRE_SLIP_PEAK)   friction = TIRE_GRIP_PEAK;  // peak plateau
+                    else                              { float t = (slip - TIRE_SLIP_PEAK) / (1.0f - TIRE_SLIP_PEAK);
+                                                        friction = TIRE_GRIP_PEAK - t * (TIRE_GRIP_PEAK - TIRE_GRIP_SPIN); }  // drop
+                    friction = fmaxf(friction, TIRE_GRIP_SPIN);
                 } else {
                     // FRONT wheels — not driven, rolling contact, near peak always
-                    friction = 1.00f;
+                    friction = TIRE_FRONT_GRIP;
                 }
                 wb->setFriction(friction);
             }
