@@ -117,7 +117,7 @@ static const float CHASSIS_MASS    =  80.0f;   // kg  (try 30 – 150)
 
 //  CAR_BODY_MASS  = mass of the visible car body (kg).  This is the dominant weight
 //                   that loads the suspension springs and increases tire grip.
-static const float CAR_BODY_MASS   = 700.0f;   // kg  (try 400 – 1000)
+static const float CAR_BODY_MASS   = 1500.0f;   // kg  (try 400 – 1000)
 //                   Total sprung mass per corner = (CHASSIS_MASS + CAR_BODY_MASS) / 4
 // =============================================================================
 
@@ -127,7 +127,7 @@ static const float CAR_BODY_MASS   = 700.0f;   // kg  (try 400 – 1000)
 //  DRIVE_TORQUE   = torque (Nm) applied to each rear wheel axle per physics step.
 //                   Higher → faster acceleration and more wheelspin at launch.
 //                   Lower  → sluggish acceleration, less wheelspin.
-static const float DRIVE_TORQUE    = 700.0f;   // Nm  (try 200 – 1500)
+static const float DRIVE_TORQUE    = 1000.0f;   // Nm  (try 200 – 1500)
 
 //  MAX_WHEEL_SPIN = angular velocity cap on driven wheels (rad/s).
 //                   Prevents wheels from spinning infinitely fast.
@@ -430,6 +430,7 @@ struct InputState {
     bool  reset    = false;
     bool  toggleBBox = false;
     bool  toggleCOM  = false;
+    bool  toggleCamera = false;
 
     // Movement for object picking (when a piece is held)
     btVector3 pickMove = {0,0,0}; 
@@ -445,6 +446,7 @@ static void PollInput(InputState& state, float dt)
     state.reset    = IsKeyPressed(KEY_R);
     state.toggleBBox = IsKeyPressed(KEY_B);
     state.toggleCOM  = IsKeyPressed(KEY_V);
+    state.toggleCamera = IsKeyPressed(KEY_C);
     state.pickMove = {0,0,0};
 
     // ── DRIVER FLAPPING DIAGNOSTIC ───────────────────────────────────────────
@@ -1078,6 +1080,9 @@ int main()
         }
 
         // Camera orbit
+        static bool useFollowCamera = false;
+        if (io.toggleCamera) useFollowCamera = !useFollowCamera;
+
         if (!isPicking) {
             if (IsMouseButtonDown(MOUSE_BUTTON_RIGHT)) {
                 Vector2 d=GetMouseDelta();
@@ -1088,12 +1093,19 @@ int main()
             if(camDistTgt<3.f)camDistTgt=3.f; if(camDistTgt>90.f)camDistTgt=90.f;
             camDist+=(camDistTgt-camDist)*8.f*dt;
         }
+        
+        Vector3 camTgt = camFocus;
+        if (useFollowCamera && gChassisBody) {
+            btTransform ct; gChassisBody->getMotionState()->getWorldTransform(ct);
+            camTgt = { (float)ct.getOrigin().x(), 0.5f, (float)ct.getOrigin().z() };
+        }
+
         float yr=camYaw*DEG2RAD, pr=camPitch*DEG2RAD;
         Camera3D cam={};
-        cam.position={camFocus.x+camDist*cosf(pr)*sinf(yr),
-                      camFocus.y+camDist*sinf(pr),
-                      camFocus.z+camDist*cosf(pr)*cosf(yr)};
-        cam.target=camFocus; cam.up={0,1,0}; cam.fovy=45.f;
+        cam.position={camTgt.x+camDist*cosf(pr)*sinf(yr),
+                      camTgt.y+camDist*sinf(pr),
+                      camTgt.z+camDist*cosf(pr)*cosf(yr)};
+        cam.target=camTgt; cam.up={0,1,0}; cam.fovy=45.f;
         cam.projection=CAMERA_PERSPECTIVE;
 
         // Reset
@@ -1538,6 +1550,8 @@ int main()
             
             if (showCOM)  DrawText("V — COM VISUALIZER ON (Magenta = True Center)",   10, ly+128, 13, {255,100,255,255});
             else          DrawText("V — show combined center of mass",                10, ly+128, 13, {120,120,140,180});
+            
+            DrawText("C — Toggle Camera Mode (Free Orbit / Car Follow)",              10, ly+144, 13, {180,220,180,255});
 
             // Draw the 2D Center of Mass Overlay
             if (showCOM) {
