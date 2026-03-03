@@ -90,6 +90,7 @@ int main()
 {
     InitWindow(1280, 720, "Vortex Racing — Bullet Physics");
     SetTargetFPS(60);
+    InitAudioDevice();
 
     // =========================================================================
     // ██████████████████████████████████████████████████████████████████████
@@ -185,6 +186,52 @@ int main()
     // Set negative to lower the chassis since bodyBob was raising it above the wheels.
     // Tune this until the car body sits flush over the wheel arches.
     const float P_CHASSIS_Y_OFFSET = -0.05f;
+
+    // =========================================================================
+
+    // =========================================================================
+    //  ENGINE AUDIO — Pseudo-Granular Blender
+    //  7 EXT samples: 1500, 2000, 3000, 4000, 5000, 6000, 7000 RPM.
+    //  Each frame: find the two bracketing samples, set their volumes (crossfade)
+    //  and pitch-shift them so they meet exactly at the current RPM.
+    //  Crossfade window = 500 RPM either side of each sample point.
+    // =========================================================================
+    static const int    ENG_SAMPLE_COUNT = 7;
+    static const float  ENG_RPM_POINTS[ENG_SAMPLE_COUNT] = {
+        1500.f, 2000.f, 3000.f, 4000.f, 5000.f, 6000.f, 7000.f
+    };
+    static const char*  ENG_FILES[ENG_SAMPLE_COUNT] = {
+        "Engine Sounds/Audi_1500_0_EXT.wav",
+        "Engine Sounds/Audi_2000_1_EXT.wav",
+        "Engine Sounds/Audi_3000_1_EXT.wav",
+        "Engine Sounds/Audi_4000_1_EXT.wav",
+        "Engine Sounds/Audi_5000_1_EXT.wav",
+        "Engine Sounds/Audi_6000_1_EXT.wav",
+        "Engine Sounds/Audi_7000_1_EXT.wav",
+    };
+    // Crossfade window expressed as half-gap between adjacent RPM points.
+    // Linear blend: at exactlythe sample point → 100% that sample, 0% neighbours.
+    const float ENG_XFADE_WINDOW = 500.0f;
+
+    Sound engSounds[ENG_SAMPLE_COUNT];
+    for (int i = 0; i < ENG_SAMPLE_COUNT; i++) {
+        engSounds[i] = LoadSound(ENG_FILES[i]);
+        // Stagger start-times by a small random offset (0–0.08 s) to avoid flanging
+        // when two samples play simultaneously near a crossfade boundary.
+        SetSoundVolume(engSounds[i], 0.0f);  // start silent
+        PlaySound(engSounds[i]);             // begin looping immediately (muted)
+    }
+
+    // RPM model — derived from wheel angular velocity.
+    // Idle at ~1500 RPM when stationary; peaks at 7000 RPM.
+    // Formula mirrors a simple 1-gear mapping: RPM = idle + wheelOmega * scale
+    float currentRPM     = 1500.0f;   // smoothed display + audio RPM
+    float rawRPM         = 1500.0f;
+    const float RPM_IDLE  = 1500.0f;
+    const float RPM_MAX   = 7000.0f;
+    // wheel_omega → RPM scale: at ~22 km/h (6.1 m/s), omega ≈ 18.3 rad/s → map to ~4500 RPM
+    // That gives ~246 RPM per rad/s. We'll use 220 so it peaks at ~7000 at 130+ km/h.
+    const float RPM_OMEGA_SCALE = 220.0f;
 
     // =========================================================================
 
@@ -869,6 +916,85 @@ int main()
         gWorld->stepSimulation(dt, 10, 1.0f / 120.0f);
 
         // =====================================================================
+        //  ENGINE RPM CALCULATION + AUDIO UPDATE
+        // =====================================================================
+        {
+            // --- Compute raw RPM from wheel spin omega ---
+            // rearSpinOmega  is the rear-wheel angular velocity (rad/s).
+            // When burning out it is intentionally high → RPM climbs like a real engine.
+            // When coasting it tracks wheel speed directly.
+            float omegaForRPM  = fabsf(rearSpinOmega);   // always positive for audio
+
+            // Throttle raises RPM toward a "blip" target when wheels aren't spinning
+            float blipRPM  = RPM_IDLE + omegaForRPM * RPM_OMEGA_SCALE;
+
+            // If throttle is held but car is barely moving, hold RPM high (rev-limiter feel)
+            if (throttleOn && absSpeedKmh < 5.0f) {
+                float burnoutRPM = RPM_IDLE + fabsf(rearSpinOmega) * RPM_OMEGA_SCALE * 1.4f;
+                if (burnoutRPM > blipRPM) blipRPM = burnoutRPM;
+            }
+
+            // Clamp RPM to valid range
+            if (blipRPM < RPM_IDLE) blipRPM = RPM_IDLE;
+            if (blipRPM > RPM_MAX ) blipRPM = RPM_MAX;
+
+            rawRPM = blipRPM;
+
+            // Smooth RPM — fast rise (throttle), slower fall (inertia / engine braking)
+            float rpmRiseRate = 8.0f;   // rev-up  speed
+            float rpmFallRate = 3.5f;   // rev-down speed (engine braking feel)
+            float rpmRate = (rawRPM > currentRPM) ? rpmRiseRate : rpmFallRate;
+            currentRPM += (rawRPM - currentRPM) * rpmRate * dt;
+
+            // --- Update engine audio: pseudo-granular crossfade blender ---
+            // Find the two samples that bracket currentRPM.
+            // sampleA = lower neighbour, sampleB = upper neighbour.
+            int   idxA = 0;
+            for (int i = 0; i < ENG_SAMPLE_COUNT - 1; i++) {
+                if (currentRPM >= ENG_RPM_POINTS[i]) idxA = i;
+                else break;
+            }
+            int   idxB = idxA + 1;
+            if (idxB >= ENG_SAMPLE_COUNT) idxB = ENG_SAMPLE_COUNT - 1;
+
+            // Linear blend factor t: 0 = fully at sampleA, 1 = fully at sampleB
+            float rpmA = ENG_RPM_POINTS[idxA];
+            float rpmB = ENG_RPM_POINTS[idxB];
+            float span = rpmB - rpmA;  // distance between sample points
+            float t    = (span > 0.01f) ? (currentRPM - rpmA) / span : 0.0f;
+            if (t < 0.0f) t = 0.0f;
+            if (t > 1.0f) t = 1.0f;
+
+            // Volume: sampleA fades out (1-t), sampleB fades in (t)
+            float volA = (1.0f - t);
+            float volB = t;
+
+            // Pitch: each sample is pitched so it sounds exactly at currentRPM.
+            //   pitchA = currentRPM / rpmA  (e.g. 3200/3000 = 1.067x)
+            //   pitchB = currentRPM / rpmB  (e.g. 3200/4000 = 0.800x)
+            float pitchA = (rpmA > 0.0f) ? (currentRPM / rpmA) : 1.0f;
+            float pitchB = (rpmB > 0.0f) ? (currentRPM / rpmB) : 1.0f;
+
+            // Apply to the two active slots; silence ALL others
+            for (int i = 0; i < ENG_SAMPLE_COUNT; i++) {
+                // Keep all sounds looping — restart if finished
+                if (!IsSoundPlaying(engSounds[i])) PlaySound(engSounds[i]);
+
+                if (i == idxA && idxA != idxB) {
+                    SetSoundVolume(engSounds[i], volA * 0.85f);
+                    SetSoundPitch (engSounds[i], pitchA);
+                } else if (i == idxB) {
+                    // When idxA == idxB (at exact top) play at full volume
+                    float v = (idxA == idxB) ? 1.0f : volB;
+                    SetSoundVolume(engSounds[i], v * 0.85f);
+                    SetSoundPitch (engSounds[i], pitchB);
+                } else {
+                    SetSoundVolume(engSounds[i], 0.0f);
+                }
+            }
+        }
+
+        // =====================================================================
         //  READ-BACK: extract carPos, heading, wheelSpin from Bullet
         // =====================================================================
         btTransform chassisTrans;
@@ -1169,6 +1295,24 @@ int main()
 
             // --- HUD ---
             DrawText("Arcade Drift Engine", 10, 10, 18, WHITE);
+
+            // RPM gauge
+            {
+                float rpmFrac = (currentRPM - RPM_IDLE) / (RPM_MAX - RPM_IDLE);
+                if (rpmFrac < 0.0f) rpmFrac = 0.0f;
+                if (rpmFrac > 1.0f) rpmFrac = 1.0f;
+
+                // Colour: green → yellow → red as RPM climbs
+                Color rpmCol;
+                if (rpmFrac < 0.6f)       rpmCol = {80, 220, 80, 255};   // green
+                else if (rpmFrac < 0.85f) rpmCol = {255, 200, 0, 255};   // yellow
+                else                       rpmCol = {255, 50, 50, 255};   // red
+
+                int barW = 200;
+                DrawText(TextFormat("RPM       : %5.0f", currentRPM), 10, 138, 16, rpmCol);
+                DrawRectangle(160, 140, barW, 14, {40,40,40,200});
+                DrawRectangle(160, 140, (int)(rpmFrac * barW), 14, rpmCol);
+            }
             DrawText(TextFormat("Speed     : %5.1f km/h",  fabsf(curSpeedKmh)), 10, 36, 16, GREEN);
 
             // Drift score bar (research: 1 - velDir.carFwd)
@@ -1233,6 +1377,13 @@ int main()
     delete gBroadphase;
     delete gDispatcher;
     delete gCollCfg;
+
+    // Engine audio
+    for (int i = 0; i < ENG_SAMPLE_COUNT; i++) {
+        StopSound(engSounds[i]);
+        UnloadSound(engSounds[i]);
+    }
+    CloseAudioDevice();
 
     // Raylib objects
     for (int i = 0; i < 4; i++) UnloadModel(wheelModels[i]);
