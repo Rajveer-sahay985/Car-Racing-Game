@@ -76,18 +76,25 @@ static const float CAR_PITCH_DEG  =   0.0f;  // degrees  (try -5 to +5)
 //                 Leaning LEFT?  → use a positive value.
 static const float CAR_ROLL_DEG   =   0.0f;  // degrees  (try -5 to +5)
 
-//  CAR BODY LOCAL POSITION OFFSET  (shifts the visual model, not the physics)
-//  ───────────────────────────────────────────────────────────────────
-//  CAR_OFF_X    = slide car body LEFT (+) or RIGHT (-).
-static const float CAR_OFF_X      =   0.0f;  // metres
+//  CAR BODY PHYSICS POSITION OFFSET  (moves the PHYSICS body relative to chassis
+//  ─────────────────────────────────  AND the visual follows automatically)
+//
+//  These use the btFixedConstraint frame, so when you change them:
+//   ► the physics bounding box moves
+//   ► the visual model follows (SyncTransform reads the physics body)
+//   ► they are ALWAYS in sync — no separate visual offset needed
+//
+//  CAR_PHYS_OFF_X  = shift car body LEFT (+) or RIGHT (-) of chassis centre.
+static const float CAR_PHYS_OFF_X =   0.0f;   // metres
 
-//  CAR_OFF_Y    = slide car body UP (+) or DOWN (-).
-//                 Car sitting too HIGH above wheels? → use a negative value.
-//                 Car clipping INTO wheels?          → use a positive value.
-static const float CAR_OFF_Y      =   0.6f;  // metres  (e.g. -0.3 to lower body)
+//  CAR_PHYS_OFF_Y  = shift car body UP (+) or DOWN (-).
+//                    Car body too LOW / clipping floor? → increase this value.
+//                    Car body too HIGH / floating?      → decrease this value.
+//                    Start at 0.0 and tune in 0.1 m steps.
+static const float CAR_PHYS_OFF_Y =   0.6f;   // metres  (try 0.3 – 0.8)
 
-//  CAR_OFF_Z    = slide car body FORWARD (+) or BACKWARD (-).
-static const float CAR_OFF_Z      =   -0.1f;  // metres
+//  CAR_PHYS_OFF_Z  = push car body FORWARD (+) or BACKWARD (-) of chassis centre.
+static const float CAR_PHYS_OFF_Z =  -0.1f;   // metres
 // =============================================================================
 
 // =============================================================================
@@ -618,12 +625,20 @@ int main()
         // When flipped, it correctly rests on the ground instead of clipping through.
         // No flag needed — LoadPhysObj already creates a standard dynamic rigid body.
 
-        // Snap car body to chassis position so the fixed constraint starts at offset=0
+        // Place car body at chassis position + physics offset, then weld with btFixedConstraint.
+        // CAR_PHYS_OFF_* is the pivot in CHASSIS local space where the car body anchors.
+        // SyncTransform reads gCarBody.body's world transform — so visual follows automatically.
         btTransform ct; gChassisBody->getMotionState()->getWorldTransform(ct);
-        gCarBody.body->setWorldTransform(ct);
-        gCarBody.body->getMotionState()->setWorldTransform(ct);
-        // Bolt car body to chassis with a zero-offset fixed constraint
-        btTransform fA, fB; fA.setIdentity(); fB.setIdentity();
+        btVector3 physOff(CAR_PHYS_OFF_X, CAR_PHYS_OFF_Y, CAR_PHYS_OFF_Z);
+        btTransform carInitT = ct;
+        carInitT.setOrigin(ct.getOrigin() + ct.getBasis() * physOff);
+        gCarBody.body->setWorldTransform(carInitT);
+        gCarBody.body->getMotionState()->setWorldTransform(carInitT);
+        // Constraint: fA.origin = physOff (pivot in chassis local space)
+        //             fB.origin = (0,0,0) (pivot at car body's own centre)
+        btTransform fA, fB;
+        fA.setIdentity(); fA.setOrigin(physOff);
+        fB.setIdentity();
         gCarWeldC = new btFixedConstraint(*gChassisBody, *gCarBody.body, fA, fB);
         gWorld->addConstraint(gCarWeldC, /*disableCollision=*/true);
 
@@ -860,17 +875,16 @@ int main()
                     }
                 }
 
-                // Draw car body with alignment correction (LOCAL-space rotation + offset)
-                // Applied BEFORE the world transform: vertices → rotate → offset → world
+                // Draw car body: visual rotation is applied in LOCAL space before world transform.
+                // Position comes from SyncTransform (physics body) — no extra translate needed.
                 {
                     Matrix carLocal =
-                        MatrixMultiply(MatrixMultiply(
+                        MatrixMultiply(
                             MatrixRotateXYZ({CAR_PITCH_DEG*DEG2RAD, CAR_YAW_DEG*DEG2RAD, CAR_ROLL_DEG*DEG2RAD}),
-                            MatrixTranslate(CAR_OFF_X, CAR_OFF_Y, CAR_OFF_Z)),
-                        gCarBody.model.transform);
+                            gCarBody.model.transform);
                     Matrix savedT = gCarBody.model.transform;
                     gCarBody.model.transform = carLocal;
-                    DrawModel(gCarBody.model,{0,0,0},1.f,WHITE);   // use texture colour
+                    DrawModel(gCarBody.model,{0,0,0},1.f,WHITE);   // show texture
                     DrawModelWires(gCarBody.model,{0,0,0},1.f,{40,50,60,100});
                     gCarBody.model.transform = savedT;
                 }
