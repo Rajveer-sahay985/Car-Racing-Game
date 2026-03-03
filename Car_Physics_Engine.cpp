@@ -173,7 +173,7 @@ int main()
     // =========================================================================
 
     // --- Engine / Brakes ---
-    const float P_ENGINE_FORCE    = 3000.0f;  // N on rear wheels (higher = faster)
+    const float P_ENGINE_FORCE    = 9000.0f;  // N on rear wheels (higher = faster)
     const float P_BRAKE_FORCE     = 160.0f;   // N·m per wheel (higher = sharper max brake)
     const float P_ENGINE_IN_RATE  = 6.0f;     // throttle ramp speed
     const float P_ENGINE_OUT_RATE = 10.0f;    // coast ramp speed
@@ -190,16 +190,16 @@ int main()
     const float P_STEER_SPEED_REDUCE = 0.77f;// how much high speed reduces steer
 
     // --- Suspension ---
-    const float P_SUSP_STIFFNESS  = 25.0f;   // spring stiffness (higher = stiffer ride)
-    const float P_SUSP_DAMPING    = 3.0f;    // oscillation damping
-    const float P_SUSP_COMPRESS   = 4.0f;    // compression damping
-    const float P_SUSP_TRAVEL_CM  = 20.0f;   // max travel in cm
-    const float P_SUSP_MAX_FORCE  = 7000.0f; // max spring force (N)
+    const float P_SUSP_STIFFNESS  = 13.0f;   // spring stiffness — softened for real bounce
+    const float P_SUSP_DAMPING    = 2.0f;    // oscillation damping (lower = more bounce)
+    const float P_SUSP_COMPRESS   = 3.5f;    // compression damping
+    const float P_SUSP_TRAVEL_CM  = 25.0f;   // max travel in cm (more room to compress)
+    const float P_SUSP_MAX_FORCE  = 4500.0f; // max spring force — scaled with stiffness
     const float P_SUSP_LENGTH     = 0.45f;   // rest length (m)
     const float P_WHEEL_RADIUS    = 0.333f;  // visual + physics wheel radius (m)
 
     // --- Chassis ---
-    const float P_CHASSIS_MASS    = 700.0f;  // kg (lower = lighter, easier to drift)
+    const float P_CHASSIS_MASS    = 1500.0f;  // kg (lower = lighter, easier to drift)
     const float P_LINEAR_DAMP     = 0.15f;   // air/roll resistance (0=float, 0.3=sluggish)
     const float P_ANGULAR_DAMP    = 0.75f;   // yaw drag
     const float P_ROLL_INFLUENCE  = 0.15f;   // anti-roll (0=tippy, 0.5=planted)
@@ -251,7 +251,7 @@ int main()
     // Issue #2: P_BODY_PITCH controls nose-dive (braking) and rear-squat (acceleration).
     //   Suspension geometric pitch = (frontComp - rearComp) * suspLength / wheelBase * PITCH_SCALE
     //   At 0.15 compression diff: 0.15 * 0.45 / 2.5 * 2.5 = 0.068 rad ≈ 3.9°
-    const float P_BODY_PITCH      = 2.5f;    // nose-dive / squat intensity (pitch scale factor)
+    const float P_BODY_PITCH      = 5.5f;    // nose-dive / squat intensity (higher = stronger)
     const float P_SUSP_BOB_SCALE  = 0.7f;   // suspension height bob multiplier (for chassis only)
     const float P_VIB_AMP         = 0.003f;  // engine vibration amplitude
     const float P_VIB_FREQ        = 14.0f;   // engine vibration frequency (Hz)
@@ -1077,43 +1077,65 @@ int main()
 
         btVector3 origin = chassisTrans.getOrigin();
 
-        // --- Self-calibrating rest height ---
-        // After 0.5s the suspension has settled under gravity.
-        // Whatever Y the chassis is at that point becomes our "ground zero" reference.
-        // On flat ground: carPos.y = 0 always.  On a ramp: carPos.y rises correctly.
-        static float restY       = 0.80f;
-        static float calibTimer  = 0.0f;
+        // --- Suspension-reactive chassis Y ---
+        // For each wheel IN CONTACT, derive where the chassis centre ought to be
+        // from the contact point, wheel radius, and ACTUAL suspension travel.
+        // Average across all grounded wheels so partial-ramp contact blends smoothly.
+        // If fully airborne fall back to the raw Bullet origin.y so gravity still works.
+        //
+        //   chassis_centre_Y = contact_Y + wheelRadius + suspLen - connLocalY
+        //                               (connLocalY = 0.35 = top of chassis box)
+        //
+        // restY is still used as the flat-ground zero reference (calibrated at startup).
+        static float restY          = 0.80f;
+        static float calibTimer     = 0.0f;
         static bool  restCalibrated = false;
         if (!restCalibrated) {
             calibTimer += dt;
             if (calibTimer > 0.5f) {
-                restY = (float)origin.y();  // measure settled height
+                restY = (float)origin.y();
                 restCalibrated = true;
             }
         }
+
+        float sumContactChassisY = 0.0f;
+        int   nContact           = 0;
+        for (int wi = 0; wi < 4; wi++) {
+            const btWheelInfo& w = vehicle->getWheelInfo(wi);
+            if (w.m_raycastInfo.m_isInContact) {
+                float cy  = (float)w.m_raycastInfo.m_contactPointWS.y();
+                float sl  = (float)w.m_raycastInfo.m_suspensionLength;
+                sumContactChassisY += cy + P_WHEEL_RADIUS + sl - 0.35f;
+                nContact++;
+            }
+        }
+
+        float targetChassisY = (nContact > 0)
+            ? (sumContactChassisY / nContact)
+            : (float)origin.y();   // airborne: trust Bullet gravity directly
+
+        // Smooth toward target — fast enough to track ramp geometry, slow enough to absorb
+        // single-wheel contact noise.  18/s ≈ 55ms response.
+        static float smoothChassisY  = 0.0f;
+        static bool  smoothChassisInit = false;
+        if (!smoothChassisInit) { smoothChassisY = (float)origin.y(); smoothChassisInit = true; }
+        smoothChassisY += (targetChassisY - smoothChassisY) * 18.0f * dt;
+
         carPos = {
             (float)origin.x(),
-            (float)origin.y() - restY,   // 0 on flat ground, +ve on ramp, -ve if airborne below start
+            smoothChassisY - restY,   // 0 on flat ground, +ve on ramp
             (float)origin.z()
         };
 
         // --- Extract full 3D chassis orientation from Bullet ---
-        // physMat is a proper Raylib (OpenGL column-major) rotation matrix
-        // built from the chassis btMatrix3x3 basis.
-        // This gives us correct pitch and roll on slopes AND in air,
-        // unlike the old MatrixRotateY(heading)-only approach.
         btMatrix3x3 rot = chassisTrans.getBasis();
         Matrix physMat;
-        // Column 0 = local X in world space
         physMat.m0  = (float)rot[0][0]; physMat.m1  = (float)rot[1][0];
         physMat.m2  = (float)rot[2][0]; physMat.m3  = 0.0f;
-        // Column 1 = local Y in world space
         physMat.m4  = (float)rot[0][1]; physMat.m5  = (float)rot[1][1];
         physMat.m6  = (float)rot[2][1]; physMat.m7  = 0.0f;
-        // Column 2 = local Z in world space
         physMat.m8  = (float)rot[0][2]; physMat.m9  = (float)rot[1][2];
         physMat.m10 = (float)rot[2][2]; physMat.m11 = 0.0f;
-        // Column 3 = translation (zero — added via MatrixTranslate later)
         physMat.m12 = 0.0f; physMat.m13 = 0.0f; physMat.m14 = 0.0f; physMat.m15 = 1.0f;
 
         // Extract yaw heading: forward axis in world space (+Z local → world)
