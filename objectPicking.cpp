@@ -118,7 +118,7 @@ static const float CAR_BODY_MASS   = 700.0f;   // kg  (try 400 – 1000)
 //  DRIVE_TORQUE   = torque (Nm) applied to each rear wheel axle per physics step.
 //                   Higher → faster acceleration and more wheelspin at launch.
 //                   Lower  → sluggish acceleration, less wheelspin.
-static const float DRIVE_TORQUE    = 1050.0f;   // Nm  (try 200 – 1500)
+static const float DRIVE_TORQUE    = 700.0f;   // Nm  (try 200 – 1500)
 
 //  MAX_WHEEL_SPIN = angular velocity cap on driven wheels (rad/s).
 //                   Prevents wheels from spinning infinitely fast.
