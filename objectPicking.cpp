@@ -634,7 +634,7 @@ int main()
 
         // ── Drive rear wheels + steer front wheels (arrow keys) ──────────────
         {
-            const float DRIVE_TORQUE = 100.0f;
+            const float DRIVE_TORQUE = 450.0f;
             const float MAX_SPIN     =  20.0f;
 
             // Rear-wheel drive: angular torque on RL+RR axles
