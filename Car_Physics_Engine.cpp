@@ -1076,14 +1076,45 @@ int main()
         chassis->getMotionState()->getWorldTransform(chassisTrans);
 
         btVector3 origin = chassisTrans.getOrigin();
-        // carPos.y = chassis centre Y relative to flat-ground rest height (0.80m).
-        // On flat ground: origin.y ≈ 0.80 → carPos.y = 0 → no change from before.
-        // On a ramp:      origin.y rises  → carPos.y > 0 → car visual follows physics up.
+
+        // --- Self-calibrating rest height ---
+        // After 0.5s the suspension has settled under gravity.
+        // Whatever Y the chassis is at that point becomes our "ground zero" reference.
+        // On flat ground: carPos.y = 0 always.  On a ramp: carPos.y rises correctly.
+        static float restY       = 0.80f;
+        static float calibTimer  = 0.0f;
+        static bool  restCalibrated = false;
+        if (!restCalibrated) {
+            calibTimer += dt;
+            if (calibTimer > 0.5f) {
+                restY = (float)origin.y();  // measure settled height
+                restCalibrated = true;
+            }
+        }
         carPos = {
             (float)origin.x(),
-            (float)origin.y() - 0.80f,   // relative height: 0 on flat ground, +ve on ramp
+            (float)origin.y() - restY,   // 0 on flat ground, +ve on ramp, -ve if airborne below start
             (float)origin.z()
         };
+
+        // --- Extract full 3D chassis orientation from Bullet ---
+        // physMat is a proper Raylib (OpenGL column-major) rotation matrix
+        // built from the chassis btMatrix3x3 basis.
+        // This gives us correct pitch and roll on slopes AND in air,
+        // unlike the old MatrixRotateY(heading)-only approach.
+        btMatrix3x3 rot = chassisTrans.getBasis();
+        Matrix physMat;
+        // Column 0 = local X in world space
+        physMat.m0  = (float)rot[0][0]; physMat.m1  = (float)rot[1][0];
+        physMat.m2  = (float)rot[2][0]; physMat.m3  = 0.0f;
+        // Column 1 = local Y in world space
+        physMat.m4  = (float)rot[0][1]; physMat.m5  = (float)rot[1][1];
+        physMat.m6  = (float)rot[2][1]; physMat.m7  = 0.0f;
+        // Column 2 = local Z in world space
+        physMat.m8  = (float)rot[0][2]; physMat.m9  = (float)rot[1][2];
+        physMat.m10 = (float)rot[2][2]; physMat.m11 = 0.0f;
+        // Column 3 = translation (zero — added via MatrixTranslate later)
+        physMat.m12 = 0.0f; physMat.m13 = 0.0f; physMat.m14 = 0.0f; physMat.m15 = 1.0f;
 
         // Extract yaw heading: forward axis in world space (+Z local → world)
         btVector3 fwdBt = chassisTrans.getBasis() * btVector3(0, 0, 1);
@@ -1302,45 +1333,35 @@ int main()
                     * (fabsf(curSpeedKmh) / 80.0f)
                     * sinf((float)GetTime() * P_VIB_FREQ * 6.2832f);
 
-                // ── CHASSIS matrix: full 6DOF including pitch (nose-dive/squat) and roll ──
-                // bodyBob raises the chassis body as suspension compresses (visual spring effect).
-                // P_CHASSIS_Y_OFFSET is a static tune parameter — adjust to seat the body flush
-                // in the wheel arches. Negative = lower the body.
+                // ── CHASSIS matrix: physMat (full Bullet rotation) + visual lean offsets ──
+                // physMat gives correct pitch + roll + yaw from the physics simulation.
+                // bodyPitch and bodyRoll are kept as small ADDITIVE visual effects on top:
+                //   bodyRoll  → weight transfer in corners (feels like body lean under G)
+                //   bodyPitch → nose-dive under braking / squat under acceleration
+                // vibration  → engine shake at speed
                 Matrix carMat = MatrixMultiply(
                     MatrixMultiply(
                         MatrixMultiply(
-                            MatrixRotateX(bodyPitch),
-                            MatrixRotateZ(bodyRoll)
+                            MatrixRotateX(bodyPitch),   // additive visual pitch
+                            MatrixRotateZ(bodyRoll)     // additive visual roll
                         ),
-                        MatrixRotateY(heading)
+                        physMat                         // full physics orientation (ramp tilt etc.)
                     ),
                     MatrixTranslate(carPos.x,
                                    carPos.y + P_CHASSIS_Y_OFFSET + vibration,
                                    carPos.z)
                 );
 
-                // ── WHEEL base matrix: yaw + gentle lean only, NO pitch ──
-                //
-                //  KEY FIX — wheelie elimination:
-                //  The old code used carMat for both chassis AND wheels. When bodyPitch tilted
-                //  the chassis (rear squats under acceleration), the front wheels rose with it
-                //  — a full visual wheelie with no suspension illusion whatsoever.
-                //
-                //  Solution: give wheels their own matrix that has:
-                //    • Yaw:   wheels rotate with car heading ✓
-                //    • Lean:  20% of bodyRoll for subtle camber feel ✓
-                //    • Y=0:  wheels anchored at ground level, translate y=0 ✓
-                //    • NO pitch: wheels stay ground-parallel always ✓
-                //
-                //  Result: chassis pitches visibly over stationary wheels → looks like real
-                //  suspension compressing/extending, with no fake wheelie.
-                float wheelLean = bodyRoll * 0.2f;  // subtle camber (20% of chassis lean)
+                // ── WHEEL base matrix: physMat + gentle lean ──
+                // Wheels now use the same physMat as the chassis so they tilt correctly
+                // on ramps and in air.  wheelLean keeps the subtle camber feel.
+                float wheelLean = bodyRoll * 0.2f;
                 Matrix wheelBaseMat = MatrixMultiply(
                     MatrixMultiply(
                         MatrixRotateZ(wheelLean),
-                        MatrixRotateY(heading)
+                        physMat                         // physics orientation
                     ),
-                    MatrixTranslate(carPos.x, carPos.y, carPos.z)  // wheels follow chassis height
+                    MatrixTranslate(carPos.x, carPos.y + P_CHASSIS_Y_OFFSET, carPos.z)
                 );
 
                 // --- Wheels: front use wheelSpin (FL, index 0), rear use rearWheelSpin ---
