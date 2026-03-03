@@ -43,6 +43,54 @@
 #include <vector>
 
 // =============================================================================
+//  ★ ALIGNMENT TUNING — CHANGE ONLY THESE VALUES TO FIX VISUAL MISALIGNMENT ★
+//
+//  WHEEL FORMATION  (physics spawn positions, must match car.obj wheel arches)
+//  ───────────────────────────────────────────────────────────────────
+//  WHEEL_TRACK  = half-distance left/right from car centre to each wheel.
+//                 Increase to spread wheels out. Decrease to bring them in.
+static const float WHEEL_TRACK   = 0.85f;   // metres  (try 0.7 – 1.2)
+
+//  WHEEL_BASE   = half-distance front/rear from car centre to each axle.
+//                 Increase to push axles further out. Decrease to bring them in.
+static const float WHEEL_BASE    = 1.43f;   // metres  (try 1.2 – 1.9)
+
+//  WHEEL_HEIGHT = how high the wheel centre spawns above the ground.
+//                 If wheels float above ground → decrease. If they clip in → increase.
+static const float WHEEL_HEIGHT  = 0.40f;   // metres  (try 0.3 – 0.6)
+
+//  CAR BODY VISUAL ROTATION  (pure render correction, zero physics effect)
+//  ───────────────────────────────────────────────────────────────────
+//  CAR_YAW_DEG  = rotate car body left/right around vertical axis.
+//                 Car facing BACKWARDS?   → change to 180.0f
+//                 Car facing FORWARDS?    → keep at   0.0f
+static const float CAR_YAW_DEG   =   0.0f;  // degrees  (try 0 or 180)
+
+//  CAR_PITCH_DEG = rotate car body nose-up / nose-down.
+//                  Nose pointing UP?  → use a negative value.
+//                  Nose pointing DOWN? → use a positive value.
+static const float CAR_PITCH_DEG  =   0.0f;  // degrees  (try -5 to +5)
+
+//  CAR_ROLL_DEG = tilt car body left or right (rarely needed).
+//                 Leaning RIGHT? → use a negative value.
+//                 Leaning LEFT?  → use a positive value.
+static const float CAR_ROLL_DEG   =   0.0f;  // degrees  (try -5 to +5)
+
+//  CAR BODY LOCAL POSITION OFFSET  (shifts the visual model, not the physics)
+//  ───────────────────────────────────────────────────────────────────
+//  CAR_OFF_X    = slide car body LEFT (+) or RIGHT (-).
+static const float CAR_OFF_X      =   0.0f;  // metres
+
+//  CAR_OFF_Y    = slide car body UP (+) or DOWN (-).
+//                 Car sitting too HIGH above wheels? → use a negative value.
+//                 Car clipping INTO wheels?          → use a positive value.
+static const float CAR_OFF_Y      =   0.6f;  // metres  (e.g. -0.3 to lower body)
+
+//  CAR_OFF_Z    = slide car body FORWARD (+) or BACKWARD (-).
+static const float CAR_OFF_Z      =   -0.1f;  // metres
+// =============================================================================
+
+// =============================================================================
 //  BULLET WORLD
 // =============================================================================
 static btDefaultCollisionConfiguration*     gCollCfg    = nullptr;
@@ -335,10 +383,12 @@ static void DrawVtxViz(const PhysicsObj& obj, int hVI, Vector3 hVW,
 //  SCENE GLOBALS
 // =============================================================================
 static PhysicsObj gConcrete;
+static PhysicsObj gCarBody;                            // visible steel car chassis
 static PhysicsObj gWheels[4];                          // FL FR RL RR
-static btRigidBody*                  gChassisBody=nullptr;  // invisible chassis
+static btRigidBody*                  gChassisBody=nullptr;  // invisible chassis frame
 static btCollisionShape*             gChassisShape=nullptr;
 static btGeneric6DofSpring2Constraint* gSusp[4]={};    // per-wheel spring
+static btFixedConstraint*            gCarWeldC=nullptr;  // welds car body to chassis
 
 // =============================================================================
 //  BUILD THE INVISIBLE SUSPENSION RIG
@@ -396,9 +446,9 @@ static void BuildSuspension(const btVector3 wheelSpawns[4])
 
         // ── Linear DOFs ───────────────────────────────────────────────────
         // X=locked, Z=locked → wheel cannot drift off its attachment point.
-        // Y=±0.15 m  → suspension travel window.
-        s->setLinearLowerLimit(btVector3(0.f, -0.15f, 0.f));
-        s->setLinearUpperLimit(btVector3(0.f,  0.15f, 0.f));
+        // Y=±0.20 m suspension travel (increased from 0.15 to handle car body sag).
+        s->setLinearLowerLimit(btVector3(0.f, -0.20f, 0.f));
+        s->setLinearUpperLimit(btVector3(0.f,  0.20f, 0.f));
 
         // ── Angular DOFs ──────────────────────────────────────────────────
         // In btGeneric6Dof: lower > upper = FREE, lower = upper = LOCKED, lower < upper = LIMITED.
@@ -423,11 +473,13 @@ static void BuildSuspension(const btVector3 wheelSpawns[4])
         }
 
         // ── Suspension spring on linear-Y (DOF index 1) ───────────────────
-        // Stiffness: 80 N/m.  A 15 kg tire at rest sags ~15*9.81/80 ≈ 1.8 cm.
-        // Damping: 8 Ns/m — damps oscillation without feeling rubber-band.
+        // Sprung mass = 80 kg (frame) + 700 kg (car body) = 780 kg.
+        // Per corner: 780/4 × 9.81 = 1913 N.  Stiffness 18000 N/m → ~10.6 cm sag.
+        // Natural freq: (1/2π)√(18000/195) ≈ 1.53 Hz (real cars: 1–2 Hz). 
+        // Critical damp: 2√(18000×195) = 3742 Ns/m.  We use ~0.32 of critical.
         s->enableSpring(1, true);
-        s->setStiffness(1, 80.0f);
-        s->setDamping  (1,  8.0f);
+        s->setStiffness(1, 18000.0f);
+        s->setDamping  (1,  1200.0f);
         s->setEquilibriumPoint();      // rest at zero offset (spawn height)
 
         gWorld->addConstraint(s, /*disableCollisionBetweenLinked=*/true);
@@ -501,16 +553,16 @@ int main()
     gConcrete.spawnPos=btVector3(-7.f, 5.f, 0.f);
     ResetPhysObj(gConcrete);
 
-    // ── Four tires — car formation ────────────────────────────────────────────
-    //  Formation coords (settled on ground ~ y=0.40):
-    //     FL (-1.1,  0.90,  1.6)    FR (1.1,  0.90,  1.6)
-    //     RL (-1.1,  0.90, -1.6)    RR (1.1,  0.90, -1.6)
+    // ── Four tires in car formation — positions come from the ALIGNMENT BLOCK at top ─
+    //  Formation (front = +Z, rear = -Z, left = -X, right = +X):
+    //     FL (-TRACK, H,  BASE)    FR (+TRACK, H,  BASE)
+    //     RL (-TRACK, H, -BASE)    RR (+TRACK, H, -BASE)
     struct TireDef { const char* path; const char* label; btVector3 spawn; };
     TireDef td[4]={
-        {"Obj Files/wheel_fl.obj","FL TIRE 15kg",{-1.1f,0.90f, 1.6f}},
-        {"Obj Files/wheel_fr.obj","FR TIRE 15kg",{ 1.1f,0.90f, 1.6f}},
-        {"Obj Files/wheel_rl.obj","RL TIRE 15kg",{-1.1f,0.90f,-1.6f}},
-        {"Obj Files/wheel_rr.obj","RR TIRE 15kg",{ 1.1f,0.90f,-1.6f}},
+        {"Obj Files/wheel_fl.obj","FL TIRE 15kg",{-WHEEL_TRACK, WHEEL_HEIGHT,  WHEEL_BASE}},
+        {"Obj Files/wheel_fr.obj","FR TIRE 15kg",{ WHEEL_TRACK, WHEEL_HEIGHT,  WHEEL_BASE}},
+        {"Obj Files/wheel_rl.obj","RL TIRE 15kg",{-WHEEL_TRACK, WHEEL_HEIGHT, -WHEEL_BASE}},
+        {"Obj Files/wheel_rr.obj","RR TIRE 15kg",{ WHEEL_TRACK, WHEEL_HEIGHT, -WHEEL_BASE}},
     };
 
     btVector3 wheelSpawns[4];
@@ -532,7 +584,41 @@ int main()
     // ── Build invisible suspension rig ────────────────────────────────────────
     BuildSuspension(wheelSpawns);
 
-    // ── Pickable object roster (concrete + 4 tires — chassis is invisible) ───
+    // ── Visible car body — 700 kg steel, rigidly bolted to chassis frame ─────
+    // Architecture:  [car.obj body] ──btFixedConstraint──► [gChassisBody]
+    //                                                           │
+    //                                              suspension springs (×4)
+    //                                                           │
+    //                                                      [4 × tire]
+    //                                                           │
+    //                                                        [ground]
+    // The 700 kg car body weight transfers through the fixed constraint
+    // into the chassis, compresses the suspension springs, and loads the tires.
+    // Net sprung mass per tire spring: (80+700)/4 = 195 kg.
+    {
+        gCarBody.mass=700.f; gCarBody.friction=0.40f; gCarBody.restitution=0.10f;
+        gCarBody.linDamp=0.05f; gCarBody.angDamp=0.20f;
+        gCarBody.linDampHeld=0.15f; gCarBody.angDampHeld=0.90f;
+        gCarBody.baseColor={55,65,75,255};  // dark steel
+        gCarBody.label="CAR BODY  700 kg  (steel)";
+        if (!LoadPhysObj(gCarBody,"Obj Files/car.obj")) {
+            TraceLog(LOG_ERROR,"car.obj missing"); return 1;
+        }
+        // Car body must NOT touch the ground — it's held up by the constraint chain.
+        // Setting CF_NO_CONTACT_RESPONSE makes it a ghost for collision purposes.
+        gCarBody.body->setCollisionFlags(
+            gCarBody.body->getCollisionFlags() | btCollisionObject::CF_NO_CONTACT_RESPONSE);
+        // Snap car body to chassis position so the fixed constraint starts at offset=0
+        btTransform ct; gChassisBody->getMotionState()->getWorldTransform(ct);
+        gCarBody.body->setWorldTransform(ct);
+        gCarBody.body->getMotionState()->setWorldTransform(ct);
+        // Bolt car body to chassis with a zero-offset fixed constraint
+        btTransform fA, fB; fA.setIdentity(); fB.setIdentity();
+        gCarWeldC = new btFixedConstraint(*gChassisBody, *gCarBody.body, fA, fB);
+        gWorld->addConstraint(gCarWeldC, /*disableCollision=*/true);
+    }
+
+    // ── Pickable object roster (concrete + 4 tires — car body/chassis invisible) ─
     PhysicsObj* allObjs[5]={&gConcrete,&gWheels[0],&gWheels[1],&gWheels[2],&gWheels[3]};
     const int nObjs=5;
 
@@ -669,6 +755,7 @@ int main()
 
         // Sync
         for(int i=0;i<nObjs;i++) SyncTransform(*allObjs[i]);
+        SyncTransform(gCarBody);   // car body welded to chassis — sync its visual too
 
         // ── RENDER ────────────────────────────────────────────────────────────
         BeginDrawing();
@@ -702,6 +789,21 @@ int main()
                         Color pc =isConcrete?Color{255,160,80,255}:Color{60,220,255,255};
                         DrawVtxViz(obj,hoverVI,hoverVW,held,piv,dot,glo,pc);
                     }
+                }
+
+                // Draw car body with alignment correction (LOCAL-space rotation + offset)
+                // Applied BEFORE the world transform: vertices → rotate → offset → world
+                {
+                    Matrix carLocal =
+                        MatrixMultiply(MatrixMultiply(
+                            MatrixRotateXYZ({CAR_PITCH_DEG*DEG2RAD, CAR_YAW_DEG*DEG2RAD, CAR_ROLL_DEG*DEG2RAD}),
+                            MatrixTranslate(CAR_OFF_X, CAR_OFF_Y, CAR_OFF_Z)),
+                        gCarBody.model.transform);
+                    Matrix savedT = gCarBody.model.transform;
+                    gCarBody.model.transform = carLocal;
+                    DrawModel(gCarBody.model,{0,0,0},1.f,WHITE);   // use texture colour
+                    DrawModelWires(gCarBody.model,{0,0,0},1.f,{40,50,60,100});
+                    gCarBody.model.transform = savedT;
                 }
 
                 // ── Draw invisible suspension as coloured spring-lines ───────
@@ -821,8 +923,10 @@ int main()
 
     // Cleanup
     if(pickC){gWorld->removeConstraint(pickC);delete pickC;}
+    if(gCarWeldC){gWorld->removeConstraint(gCarWeldC);delete gCarWeldC; gCarWeldC=nullptr;}
     DestroySuspension();
     for(int i=0;i<nObjs;i++){UnloadModel(allObjs[i]->model);delete allObjs[i]->shape;}
+    UnloadModel(gCarBody.model); delete gCarBody.shape;
     for(int i=gWorld->getNumCollisionObjects()-1;i>=0;i--){
         btCollisionObject* o=gWorld->getCollisionObjectArray()[i];
         btRigidBody* b=btRigidBody::upcast(o);
