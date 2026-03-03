@@ -131,16 +131,19 @@ static const float MAX_STEER_ANGLE =   0.55f;  // radians
 
 //  STEER_BLEND    = how quickly steering smoothly reaches MAX_STEER_ANGLE.
 //                   0.05 = very slow, lazy.   0.25 = snappy and responsive.
-//                   This is a per-frame lerp factor (applied at 60 fps).
 static const float STEER_BLEND     =   0.14f;  // 0.0 – 1.0
 
 //  STEER_SERVO_FORCE = max motor force of the front-wheel steering servo (N).
-//                      Higher → wheel snaps to target faster against friction.
 static const float STEER_SERVO_FORCE = 600.0f; // N  (try 300 – 2000)
 
 //  STEER_SERVO_SPEED = convergence speed of the steering servo (rad/s).
-//                      This is the velocity the servo motor tries to use.
 static const float STEER_SERVO_SPEED =   8.0f; // rad/s  (try 4 – 20)
+
+//  BRAKE_TORQUE   = counter-torque applied to ALL wheels when SPACE is held.
+//                   Higher → shorter stopping distance, more wheel lock.
+//                   Lower  → soft braking, ABS-like progressive slowdown.
+//                   brakeForce ramps 0→1.0 over ~0.3 seconds when SPACE held.
+static const float BRAKE_TORQUE    = 900.0f;   // Nm  (try 400 – 2000)
 // =============================================================================
 
 // =============================================================================
@@ -763,6 +766,7 @@ int main()
     // ── Picking state ─────────────────────────────────────────────────────────
     float moveSpeed=8.f;
     float steerAngle=0.f;               // current front-wheel steer angle (radians)
+    float brakeForce=0.f;               // [SPACE] pressure 0=off 1=full (ramps smoothly)
     const float MAX_STEER = MAX_STEER_ANGLE;  // from tuning block at top
     btPoint2PointConstraint* pickC=nullptr;
     PhysicsObj* pickedObj=nullptr;
@@ -840,12 +844,13 @@ int main()
             Vector2 md=GetMouseDelta();
             pickPivot+=btVector3(0,-md.y*0.033f,0);
             if(pickPivot.y()<0.05f)pickPivot.setY(0.05f);
+            // Arrow keys MOVE the held object in camera-relative XZ plane
             float spd=moveSpeed*dt;
             float cfX=sinf(yr),cfZ=cosf(yr),crX=cosf(yr),crZ=-sinf(yr);
-            if(IsKeyDown(KEY_W)){pickPivot-=btVector3(cfX*spd,0,cfZ*spd);}
-            if(IsKeyDown(KEY_S)){pickPivot+=btVector3(cfX*spd,0,cfZ*spd);}
-            if(IsKeyDown(KEY_A)){pickPivot-=btVector3(crX*spd,0,crZ*spd);}
-            if(IsKeyDown(KEY_D)){pickPivot+=btVector3(crX*spd,0,crZ*spd);}
+            if(IsKeyDown(KEY_UP))   {pickPivot-=btVector3(cfX*spd,0,cfZ*spd);}
+            if(IsKeyDown(KEY_DOWN)) {pickPivot+=btVector3(cfX*spd,0,cfZ*spd);}
+            if(IsKeyDown(KEY_LEFT)) {pickPivot-=btVector3(crX*spd,0,crZ*spd);}
+            if(IsKeyDown(KEY_RIGHT)){pickPivot+=btVector3(crX*spd,0,crZ*spd);}
             pickC->setPivotB(pickPivot);
             if (IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) {
                 ReleaseObj(*pickedObj,pickC);
@@ -853,14 +858,16 @@ int main()
             }
         }
 
-        // ── Drive rear wheels + steer front wheels (arrow keys) ──────────────
+        // ── Drive (WASD) + Steer (A/D) + Brake (SPACE) ─────────────────────────
+        // W = accelerate forward    S = reverse
+        // A = steer left            D = steer right
+        // SPACE = brake (ramps up progressively, applies counter-torque to all 4 wheels)
+        // Arrow keys = move held object (when mouse-picking something)
         {
-            // Torque and speed cap come from ENGINE & DRIVETRAIN block at top of file
-
-            // Rear-wheel drive: angular torque on RL+RR axles
+            // — Rear-wheel drive —
             float driveDir = 0.f;
-            if (IsKeyDown(KEY_UP))   driveDir = +1.f;  // forward
-            if (IsKeyDown(KEY_DOWN)) driveDir = -1.f;  // reverse
+            if (IsKeyDown(KEY_W)) driveDir = +1.f;  // forward
+            if (IsKeyDown(KEY_S)) driveDir = -1.f;  // reverse
             if (driveDir != 0.f) {
                 for (int wi = 2; wi <= 3; wi++) {
                     btRigidBody* wb   = gWheels[wi].body;
@@ -873,15 +880,36 @@ int main()
                 gChassisBody->activate(true);
             }
 
-            // Front-wheel steer: servo motor drives angular-Y of FL+FR constraints.
-            // Turned wheels redirect their rolling direction, lateral friction creates
-            // a real turning arc — no chassis rotation hack needed.
+            // — Steering (A / D) —
             float targetSteer = 0.f;
-            if (IsKeyDown(KEY_LEFT))  targetSteer = -MAX_STEER;  // LEFT
-            if (IsKeyDown(KEY_RIGHT)) targetSteer = +MAX_STEER;  // RIGHT
-            steerAngle += (targetSteer - steerAngle) * STEER_BLEND;   // smooth blend
+            if (IsKeyDown(KEY_A)) targetSteer = -MAX_STEER;  // LEFT
+            if (IsKeyDown(KEY_D)) targetSteer = +MAX_STEER;  // RIGHT
+            steerAngle += (targetSteer - steerAngle) * STEER_BLEND;
             if (gSusp[0]) gSusp[0]->setServoTarget(4, steerAngle);
             if (gSusp[1]) gSusp[1]->setServoTarget(4, steerAngle);
+
+            // — Progressive braking (SPACE) —
+            // brakeForce ramps 0→1 while held (full in ~10 frames), decays when released.
+            // Applies counter-torque to ALL 4 wheels proportional to brakeForce.
+            const float BRAKE_RAMP_UP   = 0.18f;  // per frame rate of build-up
+            const float BRAKE_RAMP_DOWN = 0.12f;  // per frame rate of release
+            if (IsKeyDown(KEY_SPACE)) {
+                brakeForce = fminf(brakeForce + BRAKE_RAMP_UP,   1.0f);
+            } else {
+                brakeForce = fmaxf(brakeForce - BRAKE_RAMP_DOWN, 0.0f);
+            }
+            if (brakeForce > 0.01f) {
+                for (int wi = 0; wi < 4; wi++) {
+                    btRigidBody* wb   = gWheels[wi].body;
+                    btVector3    axle = wb->getWorldTransform().getBasis() * btVector3(1,0,0);
+                    float currSpin    = (float)(wb->getAngularVelocity().dot(axle));
+                    // Counter-torque opposes current spin direction
+                    if (fabsf(currSpin) > 0.01f)
+                        wb->applyTorqueImpulse(axle * (-currSpin / fabsf(currSpin)) * (brakeForce * BRAKE_TORQUE * dt));
+                    wb->activate(true);
+                }
+                gChassisBody->activate(true);
+            }
         }
 
         // ── Pacejka-inspired slip-ratio tire friction ──────────────────────────────
@@ -1032,7 +1060,7 @@ int main()
                     btVector3 frontBt = cFwd * btCos(btScalar(steerAngle))
                                       - cRight * btSin(btScalar(steerAngle));
 
-                    bool driving = IsKeyDown(KEY_UP) || IsKeyDown(KEY_DOWN);
+                    bool driving = IsKeyDown(KEY_W) || IsKeyDown(KEY_S);
 
                     for (int i = 0; i < 4; i++) {
                         btTransform wt; gWheels[i].body->getMotionState()->getWorldTransform(wt);
@@ -1041,7 +1069,7 @@ int main()
 
                         bool isRear  = (i >= 2);
                         bool isFront = !isRear;
-                        bool isSteering = isFront && (IsKeyDown(KEY_LEFT)||IsKeyDown(KEY_RIGHT));
+                        bool isSteering = isFront && (IsKeyDown(KEY_A)||IsKeyDown(KEY_D));
 
                         // Pick which direction vector to use
                         btVector3 dir = isRear ? cFwd : frontBt;
