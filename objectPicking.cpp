@@ -138,6 +138,7 @@ struct PhysicsObj {
     float angDamp     = 0.60f;
     float linDampHeld = 0.25f;
     float angDampHeld = 0.97f;
+    float wheelRadius = 0.35f;  // cylinder rolling radius (m) — set from shape on load
     Color baseColor   = WHITE;
     const char* label = "";
     // Pre-sampled pick anchors (LOCAL space) — max 16, computed once at load.
@@ -537,7 +538,9 @@ int main()
         auto* shape=new btStaticPlaneShape(btVector3(0,1,0),0);
         btTransform t;t.setIdentity();
         auto* b=MakeRigidBody(0.f,t,shape);
-        b->setFriction(0.70f); b->setRestitution(0.04f);
+        // Ground friction = 1.0 so the tire's dynamic friction IS the contact friction.
+        // (Bullet uses geometric mean: sqrt(1.0 * tire_friction) = tire_friction exactly)
+        b->setFriction(1.0f); b->setRestitution(0.04f);
     }
 
     // ── Concrete ramp ────────────────────────────────────────────────────────
@@ -567,13 +570,19 @@ int main()
 
     btVector3 wheelSpawns[4];
     for (int i=0;i<4;i++) {
-        gWheels[i].mass=15.f; gWheels[i].friction=0.90f; gWheels[i].restitution=0.30f;
+        gWheels[i].mass=15.f; gWheels[i].friction=0.65f; gWheels[i].restitution=0.30f;
         gWheels[i].linDamp=0.12f; gWheels[i].angDamp=0.35f;
         gWheels[i].linDampHeld=0.20f; gWheels[i].angDampHeld=0.90f;
         gWheels[i].baseColor={30,30,35,255};   // dark rubber
         gWheels[i].label=td[i].label;
         if (!LoadPhysObj(gWheels[i], td[i].path, /*useWheelCylinder=*/true)){
             TraceLog(LOG_ERROR,"Missing %s",td[i].path); return 1;
+        }
+        // Extract the true cylinder radius from the collision shape so our slip
+        // calculation uses the physically correct wheel-to-ground contact speed.
+        if (auto* cyl = dynamic_cast<btCylinderShapeX*>(gWheels[i].shape)) {
+            // halfExtents.y() = radius of the cylinder in the YZ plane
+            gWheels[i].wheelRadius = (float)cyl->getHalfExtentsWithMargin().getY();
         }
         ComputeAnchors(gWheels[i]);     // pre-build 16 pick anchors
         gWheels[i].spawnPos=td[i].spawn;
@@ -604,10 +613,11 @@ int main()
         if (!LoadPhysObj(gCarBody,"Obj Files/car.obj")) {
             TraceLog(LOG_ERROR,"car.obj missing"); return 1;
         }
-        // Car body must NOT touch the ground — it's held up by the constraint chain.
-        // Setting CF_NO_CONTACT_RESPONSE makes it a ghost for collision purposes.
-        gCarBody.body->setCollisionFlags(
-            gCarBody.body->getCollisionFlags() | btCollisionObject::CF_NO_CONTACT_RESPONSE);
+        // Car body has FULL collision — convex hull contacts the floor/objects normally.
+        // During normal driving it sits above the wheels so no floor contact occurs.
+        // When flipped, it correctly rests on the ground instead of clipping through.
+        // No flag needed — LoadPhysObj already creates a standard dynamic rigid body.
+
         // Snap car body to chassis position so the fixed constraint starts at offset=0
         btTransform ct; gChassisBody->getMotionState()->getWorldTransform(ct);
         gCarBody.body->setWorldTransform(ct);
@@ -616,6 +626,21 @@ int main()
         btTransform fA, fB; fA.setIdentity(); fB.setIdentity();
         gCarWeldC = new btFixedConstraint(*gChassisBody, *gCarBody.body, fA, fB);
         gWorld->addConstraint(gCarWeldC, /*disableCollision=*/true);
+
+        // ───────────────────────────────────────────────────────────────────
+        // CRITICAL: disable direct collision between car body and all tires.
+        // The car.obj convex hull includes wheel arch geometry that OVERLAPS the
+        // tire cylinder shapes, causing massive jitter/explosion if they collide.
+        // The suspension constraints handle all car–tire positional relationships;
+        // direct Bullet collision between them is harmful, not helpful.
+        // ───────────────────────────────────────────────────────────────────
+        for (int i = 0; i < 4; i++) {
+            gCarBody.body->setIgnoreCollisionCheck(gWheels[i].body, true);
+            gWheels[i].body->setIgnoreCollisionCheck(gCarBody.body, true);
+        }
+        // Also skip car body vs invisible chassis (btFixedConstraint disables it, but make explicit)
+        gCarBody.body->setIgnoreCollisionCheck(gChassisBody, true);
+        gChassisBody->setIgnoreCollisionCheck(gCarBody.body, true);
     }
 
     // ── Pickable object roster (concrete + 4 tires — car body/chassis invisible) ─
@@ -638,6 +663,7 @@ int main()
     PhysicsObj* hoveredObj=nullptr;
     int         hoverVI=-1;
     Vector3     hoverVW={0,0,0};
+    bool        showBBox=false;   // [B] toggles physics AABB wireframe debug overlay
 
     // ==========================================================================
     //  GAME LOOP
@@ -748,6 +774,49 @@ int main()
             steerAngle += (targetSteer - steerAngle) * 0.14f;   // smooth blend
             if (gSusp[0]) gSusp[0]->setServoTarget(4, steerAngle);
             if (gSusp[1]) gSusp[1]->setServoTarget(4, steerAngle);
+        }
+
+        // ── Pacejka-inspired slip-ratio tire friction ──────────────────────────────
+        // Run EVERY frame before stepSimulation so Bullet sees the updated values.
+        //
+        //  slip = |wheelSpinSpeed - carGroundSpeed| / max(both, minSpeed)
+        //
+        //  slip  0.00 – 0.15 : friction ramps 0.65 → 1.05  (grip building up)
+        //  slip  0.15 – 0.30 : peak friction 1.05           (optimal grip window)
+        //  slip  0.30 – 1.00 : drops 1.05 → 0.35           (wheelspin / sliding)
+        //  slip  >  1.00     : clamped minimum 0.35         (full burnout)
+        //
+        //  Front wheels are not torque-driven so they barely slip — held at 1.00.
+        {
+            // Chassis forward speed projected onto its own forward axis
+            btTransform ct; gChassisBody->getMotionState()->getWorldTransform(ct);
+            btVector3 chassisFwd = ct.getBasis() * btVector3(0.f, 0.f, 1.f);
+            float vCar    = (float)gChassisBody->getLinearVelocity().dot(chassisFwd);
+            float vCarAbs = fabsf(vCar);
+
+            for (int wi = 0; wi < 4; wi++) {
+                btRigidBody* wb   = gWheels[wi].body;
+                btVector3    axle = wb->getWorldTransform().getBasis() * btVector3(1.f, 0.f, 0.f);
+                float omega       = (float)wb->getAngularVelocity().dot(axle);
+                float vSpin       = fabsf(omega) * gWheels[wi].wheelRadius;  // peripheral m/s
+
+                float friction;
+                if (wi >= 2) {
+                    // DRIVEN rear wheels — dynamic slip-based friction
+                    float denom = fmaxf(fmaxf(vCarAbs, vSpin), 0.30f);
+                    float slip  = fminf(fabsf(vSpin - vCarAbs) / denom, 1.0f);
+
+                    if      (slip < 0.15f)  friction = 0.65f + (slip / 0.15f) * 0.40f;   // build
+                    else if (slip < 0.30f)  friction = 1.05f;                               // peak
+                    else                   { float t = (slip - 0.30f) / 0.70f;
+                                             friction = 1.05f - t * 0.70f; }               // drop
+                    friction = fmaxf(friction, 0.35f);
+                } else {
+                    // FRONT wheels — not driven, rolling contact, near peak always
+                    friction = 1.00f;
+                }
+                wb->setFriction(friction);
+            }
         }
 
         // Physics
@@ -883,6 +952,37 @@ int main()
                     }
                 }
 
+                // ── Physics AABB debug overlay (press B to toggle) ──────────────────
+                // Shows the Bullet AABB for every dynamic body in the world.
+                // Useful for diagnosing overlap / tunnelling issues.
+                if (IsKeyPressed(KEY_B)) showBBox = !showBBox;
+                if (showBBox) {
+                    int n = gWorld->getNumCollisionObjects();
+                    for (int oi = 0; oi < n; oi++) {
+                        btCollisionObject* co = gWorld->getCollisionObjectArray()[oi];
+                        btVector3 mn, mx;
+                        gWorld->getBroadphase()->getAabb(
+                            co->getBroadphaseHandle(), mn, mx);
+                        BoundingBox bb = {
+                            {(float)mn.x(), (float)mn.y(), (float)mn.z()},
+                            {(float)mx.x(), (float)mx.y(), (float)mx.z()}
+                        };
+                        // Colour: red = car body, green = tires, white = chassis, cyan = concrete
+                        Color bc = WHITE;
+                        if      (co == gCarBody.body)   bc = {255, 60, 60, 200};
+                        else if (co == gChassisBody)    bc = {255,255, 80, 200};
+                        else if (co == gConcrete.body)  bc = {80, 200,255, 200};
+                        else {
+                            for (int wi=0;wi<4;wi++) if (co==gWheels[wi].body) bc={80,255,80,200};
+                        }
+                        DrawBoundingBox(bb, bc);
+                    }
+                    DrawText("[B] BBOX DEBUG ON  (Red=CarBody  Green=Tire  Yellow=Chassis  Cyan=Concrete)",
+                        10, GetScreenHeight()-24, 12, {255,200,100,255});
+                } else {
+                    DrawText("[B] show bounding boxes", 10, GetScreenHeight()-24, 11, {120,120,140,180});
+                }
+
             EndMode3D();
 
             // HUD
@@ -898,7 +998,31 @@ int main()
             PrintP(gWheels[1],84,{180,220,255,255});
             PrintP(gWheels[2],98,{180,220,255,255});
             PrintP(gWheels[3],112,{180,220,255,255});
-            DrawText("Suspension: stiffness=50 N/m  damping=6 Ns/m  travel=±20cm",10,128,12,{120,180,120,220});
+
+            // Live tire data: slip% and friction for driven rear wheels
+            {
+                btTransform ct; gChassisBody->getMotionState()->getWorldTransform(ct);
+                btVector3 fwd = ct.getBasis() * btVector3(0.f,0.f,1.f);
+                float vCar = fabsf((float)gChassisBody->getLinearVelocity().dot(fwd));
+                int yRow = 128;
+                DrawText("TIRE TELEMETRY", 10, yRow, 11, {160,255,160,200}); yRow+=14;
+                const char* wlabel[4]={"FL","FR","RL","RR"};
+                Color wcol[4]={{120,180,255,220},{120,180,255,220},{80,255,80,220},{80,255,80,220}};
+                for (int wi=0;wi<4;wi++) {
+                    btRigidBody* wb   = gWheels[wi].body;
+                    btVector3    axle = wb->getWorldTransform().getBasis()*btVector3(1,0,0);
+                    float omega = (float)wb->getAngularVelocity().dot(axle);
+                    float vSpin = fabsf(omega)*gWheels[wi].wheelRadius;
+                    float denom = fmaxf(fmaxf(vCar,vSpin),0.30f);
+                    float slip  = fminf(fabsf(vSpin-vCar)/denom,1.0f)*100.f;
+                    float fric  = (float)wb->getFriction();
+                    DrawText(TextFormat("%s  slip:%3.0f%%  grip:%.2f  spin:%.1f m/s",
+                        wlabel[wi],slip,fric,vSpin), 10,yRow,11,wcol[wi]);
+                    yRow+=13;
+                }
+                DrawText(TextFormat("car speed: %.1f m/s (%.0f km/h)",vCar,vCar*3.6f),
+                    10,yRow,11,{200,200,255,200});
+            }
 
             if (isPicking&&pickedObj){
                 bool isC=(pickedObj==&gConcrete);
