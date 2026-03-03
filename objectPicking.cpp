@@ -80,7 +80,7 @@ static btRigidBody* MakeRigidBody(float mass, const btTransform& t, btCollisionS
 struct PhysicsObj {
     Model              model;
     btRigidBody*       body       = nullptr;
-    btConvexHullShape* shape      = nullptr;
+    btCollisionShape*   shape      = nullptr;
     btVector3          centroid   = {0,0,0};
     btVector3          spawnPos   = {0,3,0};
     float mass        = 100.0f;
@@ -97,7 +97,9 @@ struct PhysicsObj {
     std::vector<Vector3> anchors;
 };
 
-static bool LoadPhysObj(PhysicsObj& obj, const char* path)
+// useWheelCylinder=true: builds a btCylinderShapeX from the mesh AABB for smooth
+// rolling contact.  The convex hull is used for non-wheel objects (ramp, slab, etc.)
+static bool LoadPhysObj(PhysicsObj& obj, const char* path, bool useWheelCylinder = false)
 {
     obj.model = LoadModel(path);
     if (obj.model.meshCount == 0) return false;
@@ -110,20 +112,52 @@ static bool LoadPhysObj(PhysicsObj& obj, const char* path)
     }
     if (!total) return false;
     centroid/=(float)total; obj.centroid=centroid;
-    obj.shape=new btConvexHullShape();
-    for (int mi=0; mi<obj.model.meshCount; mi++) {
-        Mesh& m=obj.model.meshes[mi];
-        for (int vi=0; vi<m.vertexCount; vi++) {
-            btVector3 v(m.vertices[vi*3],m.vertices[vi*3+1],m.vertices[vi*3+2]);
-            obj.shape->addPoint(v-centroid,false);
+
+    if (useWheelCylinder) {
+        // Compute AABB in centroid-centred local space
+        float mnx=1e30f,mxx=-1e30f, mny=1e30f,mxy=-1e30f, mnz=1e30f,mxz=-1e30f;
+        for (int mi=0; mi<obj.model.meshCount; mi++) {
+            Mesh& m=obj.model.meshes[mi];
+            for (int vi=0; vi<m.vertexCount; vi++) {
+                float vx=m.vertices[vi*3]-(float)centroid.x();
+                float vy=m.vertices[vi*3+1]-(float)centroid.y();
+                float vz=m.vertices[vi*3+2]-(float)centroid.z();
+                mnx=fminf(mnx,vx); mxx=fmaxf(mxx,vx);
+                mny=fminf(mny,vy); mxy=fmaxf(mxy,vy);
+                mnz=fminf(mnz,vz); mxz=fmaxf(mxz,vz);
+            }
         }
+        // halfW = half-width along X axle, radius = extent in YZ
+        float halfW  = (mxx - mnx) * 0.5f + 0.005f;
+        float radY   = (mxy - mny) * 0.5f;
+        float radZ   = (mxz - mnz) * 0.5f;
+        float radius = fmaxf(radY, radZ) + 0.005f;
+        // Cylinder axis is X (the axle direction, which we locked Angular Y/Z on).
+        obj.shape = new btCylinderShapeX(btVector3(halfW, radius, radius));
+    } else {
+        auto* hull = new btConvexHullShape();
+        for (int mi=0; mi<obj.model.meshCount; mi++) {
+            Mesh& m=obj.model.meshes[mi];
+            for (int vi=0; vi<m.vertexCount; vi++) {
+                btVector3 v(m.vertices[vi*3],m.vertices[vi*3+1],m.vertices[vi*3+2]);
+                hull->addPoint(v-centroid,false);
+            }
+        }
+        hull->recalcLocalAabb(); hull->optimizeConvexHull();
+        obj.shape = hull;
     }
-    obj.shape->recalcLocalAabb(); obj.shape->optimizeConvexHull();
+
     obj.spawnPos=btVector3(0,centroid.y()+1.f,0);
     btTransform t; t.setIdentity(); t.setOrigin(obj.spawnPos);
     obj.body=MakeRigidBody(obj.mass,t,obj.shape);
     obj.body->setFriction(obj.friction); obj.body->setRestitution(obj.restitution);
     obj.body->setDamping(obj.linDamp,obj.angDamp);
+    if (useWheelCylinder) {
+        // Cylinder rolls freely — low rolling/spinning friction avoids artificial drag
+        // on the axle rotation while still keeping high lateral grip from setFriction.
+        obj.body->setRollingFriction(0.005f);
+        obj.body->setSpinningFriction(0.005f);
+    }
     return true;
 }
 
@@ -367,13 +401,26 @@ static void BuildSuspension(const btVector3 wheelSpawns[4])
         s->setLinearUpperLimit(btVector3(0.f,  0.15f, 0.f));
 
         // ── Angular DOFs ──────────────────────────────────────────────────
-        // In btGeneric6Dof: lower > upper → FREE,  lower = upper → LOCKED.
+        // In btGeneric6Dof: lower > upper = FREE, lower = upper = LOCKED, lower < upper = LIMITED.
         //
-        //   X (spin / roll around axle):  FREE  — tire can rotate naturally
-        //   Y (yaw / steering):           LOCKED — wheel always faces forward
-        //   Z (camber / tilt):            LOCKED — wheel stays perfectly upright
-        s->setAngularLowerLimit(btVector3( 1.f, 0.f, 0.f));  // X: lower(1)>upper(-1)=FREE
-        s->setAngularUpperLimit(btVector3(-1.f, 0.f, 0.f));  // Y,Z: lower(0)=upper(0)=LOCKED
+        //   X (spin / roll):    FREE   — tire rolls naturally around the axle
+        //   Z (camber / tilt):  LOCKED — wheel stays perfectly upright
+        //   Y (steering yaw):   LOCKED for rear axle; LIMITED+MOTOR for front axle
+        if (i < 2) {
+            // FRONT wheels: ±34° steering range (≈0.60 rad) with servo motor
+            s->setAngularLowerLimit(btVector3( 1.f, -0.60f, 0.f));  // X free, Y limited, Z locked
+            s->setAngularUpperLimit(btVector3(-1.f,  0.60f, 0.f));
+            // DOF index 4 = angular Y.  Servo drives it toward setServoTarget.
+            s->enableMotor(4, true);
+            s->setServo(4, true);
+            s->setMaxMotorForce(4, 600.0f);  // strong enough to steer against friction
+            s->setTargetVelocity(4, 8.0f);   // rad/s convergence speed
+            s->setServoTarget(4, 0.0f);      // start straight ahead
+        } else {
+            // REAR wheels: Y fully locked — they never steer
+            s->setAngularLowerLimit(btVector3( 1.f, 0.f, 0.f));  // X free, Y/Z locked
+            s->setAngularUpperLimit(btVector3(-1.f, 0.f, 0.f));
+        }
 
         // ── Suspension spring on linear-Y (DOF index 1) ───────────────────
         // Stiffness: 80 N/m.  A 15 kg tire at rest sags ~15*9.81/80 ≈ 1.8 cm.
@@ -473,7 +520,7 @@ int main()
         gWheels[i].linDampHeld=0.20f; gWheels[i].angDampHeld=0.90f;
         gWheels[i].baseColor={30,30,35,255};   // dark rubber
         gWheels[i].label=td[i].label;
-        if (!LoadPhysObj(gWheels[i],td[i].path)){
+        if (!LoadPhysObj(gWheels[i], td[i].path, /*useWheelCylinder=*/true)){
             TraceLog(LOG_ERROR,"Missing %s",td[i].path); return 1;
         }
         ComputeAnchors(gWheels[i]);     // pre-build 16 pick anchors
@@ -495,6 +542,8 @@ int main()
 
     // ── Picking state ─────────────────────────────────────────────────────────
     float moveSpeed=8.f;
+    float steerAngle=0.f;               // current front-wheel steer angle (radians)
+    const float MAX_STEER=0.55f;        // ±55° max steer (≈31.5°)
     btPoint2PointConstraint* pickC=nullptr;
     PhysicsObj* pickedObj=nullptr;
     btVector3   pickPivot;
@@ -537,6 +586,9 @@ int main()
             isPicking=false; pickedObj=nullptr;
             ResetPhysObj(gConcrete);
             ResetRig(wheelSpawns);
+            // Zero steering
+            steerAngle=0.f;
+            for (int fi=0;fi<2;fi++) if(gSusp[fi]) gSusp[fi]->setServoTarget(4,0.f);
         }
 
         // Hover test
@@ -580,50 +632,36 @@ int main()
             }
         }
 
-        // ── Rear-wheel drive + steering (arrow keys) ─────────────────────────
-        // Drive:  torque applied to RL+RR around each wheel's LOCAL X axis (axle).
-        //         Rubber friction (0.90) against ground creates actual contact force.
-        //         Chassis is pulled forward by the suspension springs.
-        // Steer:  torque applied to chassis LOCAL Y axis — whole rig yaws gently.
-        // Picking the rig does NOT override driving; both can coexist.
+        // ── Drive rear wheels + steer front wheels (arrow keys) ──────────────
         {
-            const float DRIVE_TORQUE = 100.0f;    // Nm per second applied to rear axles
-            const float MAX_SPIN     = 20.0f;    // rad/s cap (≈40 km/h for r≈0.35 m)
-            const float STEER_TORQUE = 18.0f;    // Nm per second applied to chassis Y
-            const float MAX_YAW_RATE =  2.5f;    // rad/s cap on chassis spin
+            const float DRIVE_TORQUE = 100.0f;
+            const float MAX_SPIN     =  20.0f;
 
+            // Rear-wheel drive: angular torque on RL+RR axles
             float driveDir = 0.f;
-            if (IsKeyDown(KEY_UP))   driveDir = -1.f;  // −X spin = forward roll
-            if (IsKeyDown(KEY_DOWN)) driveDir =  1.f;  // +X spin = reverse roll
-
+            if (IsKeyDown(KEY_UP))   driveDir = +1.f;  // forward
+            if (IsKeyDown(KEY_DOWN)) driveDir = -1.f;  // reverse
             if (driveDir != 0.f) {
-                for (int wi = 2; wi <= 3; wi++) {   // RL=2, RR=3
-                    btRigidBody* wb = gWheels[wi].body;
-                    // Get the wheel's own axle direction (local X in world)
-                    btVector3 axle = wb->getWorldTransform().getBasis() * btVector3(1,0,0);
-                    // Cap spin speed so the torque doesn’t run away
-                    float currSpin = (float)(wb->getAngularVelocity().dot(axle));
-                    if (fabsf(currSpin) < MAX_SPIN) {
+                for (int wi = 2; wi <= 3; wi++) {
+                    btRigidBody* wb   = gWheels[wi].body;
+                    btVector3    axle = wb->getWorldTransform().getBasis() * btVector3(1,0,0);
+                    float currSpin    = (float)(wb->getAngularVelocity().dot(axle));
+                    if (fabsf(currSpin) < MAX_SPIN)
                         wb->applyTorqueImpulse(axle * (driveDir * DRIVE_TORQUE * dt));
-                    }
                     wb->activate(true);
                 }
                 gChassisBody->activate(true);
             }
 
-            float steerDir = 0.f;
-            if (IsKeyDown(KEY_LEFT))  steerDir =  1.f;
-            if (IsKeyDown(KEY_RIGHT)) steerDir = -1.f;
-
-            if (steerDir != 0.f) {
-                // Get chassis up axis in world space
-                btVector3 up = gChassisBody->getWorldTransform().getBasis() * btVector3(0,1,0);
-                float currYaw = (float)(gChassisBody->getAngularVelocity().dot(up));
-                if (fabsf(currYaw) < MAX_YAW_RATE) {
-                    gChassisBody->applyTorqueImpulse(up * (steerDir * STEER_TORQUE * dt));
-                }
-                gChassisBody->activate(true);
-            }
+            // Front-wheel steer: servo motor drives angular-Y of FL+FR constraints.
+            // Turned wheels redirect their rolling direction, lateral friction creates
+            // a real turning arc — no chassis rotation hack needed.
+            float targetSteer = 0.f;
+            if (IsKeyDown(KEY_LEFT))  targetSteer = -MAX_STEER;  // LEFT
+            if (IsKeyDown(KEY_RIGHT)) targetSteer = +MAX_STEER;  // RIGHT
+            steerAngle += (targetSteer - steerAngle) * 0.14f;   // smooth blend
+            if (gSusp[0]) gSusp[0]->setServoTarget(4, steerAngle);
+            if (gSusp[1]) gSusp[1]->setServoTarget(4, steerAngle);
         }
 
         // Physics
@@ -701,15 +739,19 @@ int main()
                 }
 
                 // ── Wheel direction arrows ─────────────────────────────────────
-                // Arrow points in the FORWARD direction of each wheel.
-                // Rear driven wheels glow bright green when a drive key is held.
+                // Arrows use CHASSIS orientation + steerAngle, NOT the rolling wheel
+                // body transform.  The wheel body spins around X as it rolls, so its
+                // local-Z sweeps constantly — reading it causes the flicker.
+                // Instead: rear arrow = chassis forward; front arrow = chassis forward
+                // rotated by steerAngle around chassis up (Rodrigues' formula).
                 {
-                    // Chassis forward = its local +Z
-                    btMatrix3x3 cb = gChassisBody->getWorldTransform().getBasis();
-                    btVector3 fwdBt = cb * btVector3(0, 0, 1);
-                    Vector3 fwd = {(float)fwdBt.x(), 0.f, (float)fwdBt.z()};
-                    float fl = sqrtf(fwd.x*fwd.x + fwd.z*fwd.z);
-                    if(fl > 0.001f){ fwd.x/=fl; fwd.z/=fl; }
+                    btMatrix3x3 cb       = gChassisBody->getWorldTransform().getBasis();
+                    btVector3   cFwd     = cb * btVector3(0.f, 0.f, 1.f);  // chassis +Z
+                    btVector3   cRight   = cb * btVector3(1.f, 0.f, 0.f);  // chassis +X
+                    // Front-wheel direction = cFwd rotated by steerAngle around chassis Y
+                    // Rodrigues (cRight ⊥ cFwd): fwd' = fwd*cos + right*sin
+                    btVector3 frontBt = cFwd * btCos(btScalar(steerAngle))
+                                      - cRight * btSin(btScalar(steerAngle));
 
                     bool driving = IsKeyDown(KEY_UP) || IsKeyDown(KEY_DOWN);
 
@@ -718,18 +760,24 @@ int main()
                         btVector3 wp = wt.getOrigin();
                         Vector3 wc = {(float)wp.x(), (float)wp.y(), (float)wp.z()};
 
-                        bool isRear = (i >= 2);
-                        // Rear wheels glow green when driven, white when idle
-                        Color arrowCol = (isRear && driving)
-                            ? Color{80,255,80,255}
-                            : (isRear ? Color{120,200,120,180} : Color{120,180,255,160});
-                        float arrowLen = isRear ? 1.0f : 0.75f;
+                        bool isRear  = (i >= 2);
+                        bool isFront = !isRear;
+                        bool isSteering = isFront && (IsKeyDown(KEY_LEFT)||IsKeyDown(KEY_RIGHT));
 
-                        Vector3 tip = {wc.x + fwd.x*arrowLen,
-                                       wc.y,
-                                       wc.z + fwd.z*arrowLen};
+                        // Pick which direction vector to use
+                        btVector3 dir = isRear ? cFwd : frontBt;
+                        Vector3 d = {(float)dir.x(), 0.f, (float)dir.z()};
+                        float dlen = sqrtf(d.x*d.x + d.z*d.z);
+                        if (dlen > 0.001f){ d.x/=dlen; d.z/=dlen; }
+
+                        Color arrowCol = (isRear && driving) ? Color{80,255,80,255}   // driven rear: bright green
+                                       : isSteering          ? Color{255,200,60,255}  // steering front: yellow
+                                       : isRear              ? Color{120,200,120,160} // idle rear: dim green
+                                                             : Color{120,180,255,160};// idle front: blue
+
+                        Vector3 tip = {wc.x + d.x*0.9f, wc.y, wc.z + d.z*0.9f};
                         DrawLine3D(wc, tip, arrowCol);
-                        DrawSphere(tip, 0.07f, arrowCol);
+                        DrawSphere(tip, 0.08f, arrowCol);
                     }
                 }
 
