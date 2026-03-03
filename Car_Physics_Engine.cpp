@@ -84,6 +84,77 @@ static Obstacle MakeObstacle(const char* objFile, Shader sh,
 }
 
 // =============================================================================
+//  STATIC TRIMESH OBSTACLE
+//  Uses btBvhTriangleMeshShape for exact slope collision.
+//  Perfect for ramps — the car physically drives up the slope surface.
+// =============================================================================
+struct StaticTrimesh {
+    Model                    model;
+    btRigidBody*             body    = nullptr;
+    btBvhTriangleMeshShape*  shape   = nullptr;
+    btTriangleMesh*          triData = nullptr;  // owned here
+    Vector3                  offset  = {0,0,0};  // applied to both visual + physics
+    Color                    tint    = WHITE;
+};
+
+// Build a trimesh obstacle from an OBJ file.
+// offset: world-space translation applied to the Bullet rigid body.
+//         The visual model is drawn at the same offset via its transform matrix.
+static StaticTrimesh MakeRampObstacle(const char* objFile, Shader sh,
+                                       Vector3 offset, Color tint = WHITE)
+{
+    StaticTrimesh obs;
+    obs.model  = LoadModel(objFile);
+    obs.offset = offset;
+    obs.tint   = tint;
+
+    for (int m = 0; m < obs.model.materialCount; m++)
+        obs.model.materials[m].shader = sh;
+
+    // --- Build btTriangleMesh from Raylib vertex/index data ---
+    obs.triData = new btTriangleMesh();
+
+    for (int mi = 0; mi < obs.model.meshCount; mi++) {
+        Mesh& mesh = obs.model.meshes[mi];
+        float* vp  = mesh.vertices;  // packed XYZ per vertex
+
+        if (mesh.indices) {
+            // Indexed mesh (common after triangulation in Blender)
+            for (int tri = 0; tri < mesh.triangleCount; tri++) {
+                unsigned short i0 = mesh.indices[tri*3+0];
+                unsigned short i1 = mesh.indices[tri*3+1];
+                unsigned short i2 = mesh.indices[tri*3+2];
+                btVector3 v0(vp[i0*3+0], vp[i0*3+1], vp[i0*3+2]);
+                btVector3 v1(vp[i1*3+0], vp[i1*3+1], vp[i1*3+2]);
+                btVector3 v2(vp[i2*3+0], vp[i2*3+1], vp[i2*3+2]);
+                obs.triData->addTriangle(v0, v1, v2);
+            }
+        } else {
+            // Non-indexed: every 3 vertices = 1 triangle
+            for (int tri = 0; tri < mesh.triangleCount; tri++) {
+                int b = tri * 9;
+                btVector3 v0(vp[b+0], vp[b+1], vp[b+2]);
+                btVector3 v1(vp[b+3], vp[b+4], vp[b+5]);
+                btVector3 v2(vp[b+6], vp[b+7], vp[b+8]);
+                obs.triData->addTriangle(v0, v1, v2);
+            }
+        }
+    }
+
+    // useQuantizedAabbCompression=true → faster queries, less memory
+    obs.shape = new btBvhTriangleMeshShape(obs.triData, true);
+
+    btTransform t;
+    t.setIdentity();
+    t.setOrigin(btVector3(offset.x, offset.y, offset.z));
+
+    obs.body = MakeRigidBody(0.0f, t, obs.shape);  // mass=0 → static
+    obs.body->setFriction(0.85f);       // grippy surface
+    obs.body->setRestitution(0.05f);    // low bounce on contact
+    return obs;
+}
+
+// =============================================================================
 //  MAIN
 // =============================================================================
 int main()
@@ -277,16 +348,16 @@ int main()
 
     // 0=FL, 1=FR, 2=RL, 3=RR
     Model wheelModels[4] = {
-        LoadModel("wheel_fr.obj"),
-        LoadModel("wheel_fl.obj"),
-        LoadModel("wheel_rr.obj"),
-        LoadModel("wheel_rl.obj"),
+        LoadModel("Obj Files/wheel_fr.obj"),
+        LoadModel("Obj Files/wheel_fl.obj"),
+        LoadModel("Obj Files/wheel_rr.obj"),
+        LoadModel("Obj Files/wheel_rl.obj"),
     };
     for (int i = 0; i < 4; i++)
         for (int m = 0; m < wheelModels[i].materialCount; m++)
             wheelModels[i].materials[m].shader = celShader;
 
-    Model carModel = LoadModel("car.obj");
+    Model carModel = LoadModel("Obj Files/car.obj");
     for (int m = 0; m < carModel.materialCount; m++)
         carModel.materials[m].shader = celShader;
 
@@ -382,20 +453,29 @@ int main()
     }
 
     // =========================================================================
-    //  OBSTACLES — commented out for car physics testing
-    //  Uncomment when ready to add collision testing back.
+    //  OBSTACLES
     // =========================================================================
-    static const int NUM_OBS = 0;     // set to 3 and uncomment below to re-enable
+    //  ----- Old box obstacles (disabled for trimesh testing) -----
+    static const int NUM_OBS = 0;
     // Obstacle gObs[3];
     // gObs[0] = MakeObstacle("bump1.obj", celShader,
-    //     btVector3(1.715f, 4.815f, 1.715f), {0.0f, 4.815f, 15.587f},
-    //     1.0f, {220, 80, 40, 255});
+    //     btVector3(1.715f, 4.815f, 1.715f), {0.0f, 4.815f, 15.587f}, 1.0f, {220, 80, 40, 255});
     // gObs[1] = MakeObstacle("bump2.obj", celShader,
-    //     btVector3(0.204f, 0.204f, 1.0f), {1.039f, -0.108f, -6.458f},
-    //     1.0f, {255, 200, 50, 255});
+    //     btVector3(0.204f, 0.204f, 1.0f), {1.039f, -0.108f, -6.458f}, 1.0f, {255, 200, 50, 255});
     // gObs[2] = MakeObstacle("bump3.obj", celShader,
-    //     btVector3(0.204f, 0.204f, 1.0f), {-7.225f, -0.074f, -9.358f},
-    //     1.0f, {80, 180, 255, 255});
+    //     btVector3(0.204f, 0.204f, 1.0f), {-7.225f, -0.074f, -9.358f}, 1.0f, {80, 180, 255, 255});
+
+    //  ----- RUNWAY RAMP (trimesh — exact slope collision) -----
+    //
+    //  Apply Transform was used on export — OBJ vertices ARE the final world positions.
+    //  No offset applied here: the ramp sits exactly where you placed it in Blender.
+    //  (You intentionally set the approach slightly underground for a smooth roll-on.)
+    StaticTrimesh runway = MakeRampObstacle(
+        "Obj Files/runway.obj",
+        celShader,
+        { 0.0f, 0.0f, 0.0f },          // NO offset — honour the Blender world position
+        { 200, 200, 210, 255 }          // light grey-blue tint
+    );
 
     // =========================================================================
     //  PHYSICS INPUT STATE
@@ -1273,9 +1353,16 @@ int main()
                 carModel.transform = chassisMat;
                 DrawModel(carModel, {0,0,0}, 1.0f, WHITE);
 
-                // --- Obstacles: disabled for car physics testing ---
-                // for (int i = 0; i < NUM_OBS; i++)
-                //     DrawModel(gObs[i].model, {0,0,0}, 1.0f, gObs[i].tint);
+                // --- Runway ramp ---
+                // Apply Transform was baked in Blender, so vertices are in OBJ-local space.
+                // We translate by runway.offset to place it in the correct world position,
+                // matching the btBvhTriangleMeshShape rigid body transform.
+                runway.model.transform = MatrixTranslate(
+                    runway.offset.x, runway.offset.y, runway.offset.z);
+                DrawModel(runway.model, {0,0,0}, 1.0f, runway.tint);
+
+                // Ramp outline for visibility (wireframe-style edge)
+                DrawModelWires(runway.model, {0,0,0}, 1.0f, {120, 120, 140, 80});
 
 
             EndMode3D();
@@ -1366,6 +1453,11 @@ int main()
     delete gBroadphase;
     delete gDispatcher;
     delete gCollCfg;
+
+    // Runway ramp trimesh (body already freed by collision objects loop above)
+    delete runway.shape;
+    delete runway.triData;
+    UnloadModel(runway.model);
 
     // Engine audio
     for (int i = 0; i < ENG_SAMPLE_COUNT; i++) {
