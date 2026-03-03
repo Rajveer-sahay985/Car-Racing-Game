@@ -15,3 +15,4 @@ clang++ objectPicking.cpp -std=c++17 \
   -lraylib -lBulletDynamics -lBulletCollision -lLinearMath \
   -framework OpenGL -framework Cocoa -framework IOKit -framework CoreVideo \
   -O2 -o sandbox && ./sandbox
+

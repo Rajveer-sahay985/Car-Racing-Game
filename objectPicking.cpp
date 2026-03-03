@@ -36,6 +36,7 @@
 
 #include "raylib.h"
 #include "raymath.h"
+#include "rlgl.h"
 #include <btBulletDynamicsCommon.h>
 #include <BulletDynamics/ConstraintSolver/btGeneric6DofSpring2Constraint.h>
 #include <cmath>
@@ -95,6 +96,14 @@ static const float CAR_PHYS_OFF_Y =   0.6f;   // metres  (try 0.3 – 0.8)
 
 //  CAR_PHYS_OFF_Z  = push car body FORWARD (+) or BACKWARD (-) of chassis centre.
 static const float CAR_PHYS_OFF_Z =  -0.1f;   // metres
+
+// =============================================================================
+//  ★ CENTER OF MASS OFFSET (Drift & Stability Tuning) ★
+// =============================================================================
+//  Lowering the COM (negative Y) makes it impossible to flip during drifts.
+//  Moving it backward (negative Z) changes the pendulum effect when sliding.
+static const float CAR_COM_OFFSET_Y  = -0.4f;  // metres (try -0.2 to -0.6)
+static const float CAR_COM_OFFSET_Z  = -0.1f;  // metres (try 0.0 to -0.3)
 // =============================================================================
 
 // =============================================================================
@@ -132,6 +141,10 @@ static const float MAX_STEER_ANGLE =   0.55f;  // radians
 //  STEER_BLEND    = how quickly steering smoothly reaches MAX_STEER_ANGLE.
 //                   0.05 = very slow, lazy.   0.25 = snappy and responsive.
 static const float STEER_BLEND     =   0.14f;  // 0.0 – 1.0
+
+static const float P_STEER_IN_RATE   = 3.5f;    // how fast steer locks in
+static const float P_STEER_OUT_RATE  = 7.0f;    // how fast steer returns to 0
+static const float P_STEER_SPEED_REDUCE = 0.77f;// how much high speed reduces steer
 
 //  STEER_SERVO_FORCE = max motor force of the front-wheel steering servo (N).
 static const float STEER_SERVO_FORCE = 600.0f; // N  (try 300 – 2000)
@@ -248,11 +261,12 @@ struct PhysicsObj {
     // Pre-sampled pick anchors (LOCAL space) — max 16, computed once at load.
     // Only these are drawn / searched on hover, eliminating per-frame vertex loops.
     std::vector<Vector3> anchors;
+    btVector3          comOffset  = {0,0,0}; // Used to keep visual in sync if COM is shifted
 };
 
 // useWheelCylinder=true: builds a btCylinderShapeX from the mesh AABB for smooth
 // rolling contact.  The convex hull is used for non-wheel objects (ramp, slab, etc.)
-static bool LoadPhysObj(PhysicsObj& obj, const char* path, bool useWheelCylinder = false)
+static bool LoadPhysObj(PhysicsObj& obj, const char* path, bool useWheelCylinder = false, float comOffsetY = 0.0f, float comOffsetZ = 0.0f)
 {
     obj.model = LoadModel(path);
     if (obj.model.meshCount == 0) return false;
@@ -298,6 +312,18 @@ static bool LoadPhysObj(PhysicsObj& obj, const char* path, bool useWheelCylinder
         }
         hull->recalcLocalAabb(); hull->optimizeConvexHull();
         obj.shape = hull;
+    }
+
+    if (comOffsetY != 0.0f || comOffsetZ != 0.0f) {
+        // Shift collision shape in the opposite direction so the rigid body origin (COM) moves relatively.
+        obj.comOffset = btVector3(0, -comOffsetY, -comOffsetZ);
+        btCompoundShape* comp = new btCompoundShape();
+        btTransform offsetT; offsetT.setIdentity();
+        offsetT.setOrigin(obj.comOffset);
+        comp->addChildShape(offsetT, obj.shape);
+        obj.shape = comp;
+    } else {
+        obj.comOffset = btVector3(0,0,0);
     }
 
     obj.spawnPos=btVector3(0,centroid.y()+1.f,0);
@@ -380,7 +406,9 @@ static void ResetPhysObj(PhysicsObj& obj)
 static void SyncTransform(PhysicsObj& obj)
 {
     btTransform bt; obj.body->getMotionState()->getWorldTransform(bt);
-    btVector3 pos=bt.getOrigin(); btMatrix3x3 rot=bt.getBasis();
+    // Shift the visual position to compensate for the COM offset
+    btVector3 pos=bt.getOrigin() + bt.getBasis() * obj.comOffset;
+    btMatrix3x3 rot=bt.getBasis();
     Matrix R;
     R.m0=(float)rot[0][0];R.m1=(float)rot[1][0];R.m2=(float)rot[2][0];R.m3=0;
     R.m4=(float)rot[0][1];R.m5=(float)rot[1][1];R.m6=(float)rot[2][1];R.m7=0;
@@ -390,6 +418,126 @@ static void SyncTransform(PhysicsObj& obj)
     obj.model.transform=MatrixMultiply(MatrixMultiply(
         MatrixTranslate(-(float)c.x(),-(float)c.y(),-(float)c.z()),R),
         MatrixTranslate((float)pos.x(),(float)pos.y(),(float)pos.z()));
+}
+
+// =============================================================================
+//  INPUT SYSTEM (Unified Keyboard + Gamepad)
+// =============================================================================
+struct InputState {
+    float throttle = 0.0f;  // -1.0 to 1.0 (forward/reverse)
+    float steering = 0.0f;  // -1.0 to 1.0 (left/right)
+    float brake    = 0.0f;  //  0.0 to 1.0 (pressure)
+    bool  reset    = false;
+    bool  toggleBBox = false;
+    bool  toggleCOM  = false;
+
+    // Movement for object picking (when a piece is held)
+    btVector3 pickMove = {0,0,0}; 
+};
+
+static int gRawSignalCount = 0;
+
+static void PollInput(InputState& state, float dt)
+{
+    state.throttle = 0.0f;
+    state.steering = 0.0f;
+    state.brake    = 0.0f;
+    state.reset    = IsKeyPressed(KEY_R);
+    state.toggleBBox = IsKeyPressed(KEY_B);
+    state.toggleCOM  = IsKeyPressed(KEY_V);
+    state.pickMove = {0,0,0};
+
+    // ── DRIVER FLAPPING DIAGNOSTIC ───────────────────────────────────────────
+    static char lastDetectedName[128] = "";
+    static int  lastDetectedSlot = -1;
+    static float flapTimer = 0;
+    
+    float rawSteer=0, rawGas=0, rawBrak=0;
+    bool anyInput = false;
+    static float controllerPriorityTimer = 0.0f;
+
+    // ── NATIVE RAYLIB HOOKS ──────────────────────────────────────────────────
+    for (int s=0; s<16; s++) {
+        if (!IsGamepadAvailable(s)) continue;
+        
+        // Read Axes regardless of reported AxisCount
+        for (int a=0; a<8; a++) {
+            float v = GetGamepadAxisMovement(s, a);
+            if (fabsf(v) > 0.03f) { 
+                if (gRawSignalCount == 0) TraceLog(LOG_INFO, "[GAMEPAD] SIGNAL ON AXIS %d", a);
+                gRawSignalCount++;
+                anyInput = true;
+                
+                // Left Stick X -> Steering
+                if (a == GAMEPAD_AXIS_LEFT_X) rawSteer = v; 
+
+                // Right Trigger -> Gas (Normalize from [-1, 1] to [0, 1])
+                if (a == GAMEPAD_AXIS_RIGHT_TRIGGER) {
+                    if (v > -0.98f) rawGas = (v + 1.0f) / 2.0f;
+                }
+                
+                // Left Trigger -> Brake 
+                if (a == GAMEPAD_AXIS_LEFT_TRIGGER) {
+                    if (v > -0.98f) rawBrak = (v + 1.0f) / 2.0f;
+                }
+            }
+        }
+        
+        // Read Buttons (Fallback if triggers act as buttons)
+        for (int b=0; b<32; b++) {
+            if (IsGamepadButtonDown(s, b)) {
+                if (gRawSignalCount == 0) TraceLog(LOG_INFO, "[GAMEPAD] SIGNAL ON BUTTON %d", b);
+                gRawSignalCount++;
+                anyInput = true;
+                
+                // Fallbacks: If triggers are picked up as buttons
+                if (b == GAMEPAD_BUTTON_RIGHT_TRIGGER_2) rawGas = 1.0f;
+                if (b == GAMEPAD_BUTTON_LEFT_TRIGGER_2) rawBrak = 1.0f;
+                
+                // Face buttons as alternatives
+                if (b == GAMEPAD_BUTTON_RIGHT_FACE_DOWN) rawGas = 1.0f;  // A button -> Gas
+                if (b == GAMEPAD_BUTTON_RIGHT_FACE_LEFT) rawBrak = 1.0f; // X button -> Brake
+            }
+        }
+    }
+    
+    // ── Input Spoofing (Hold SHIFT to simulate Gamepad signals) ────────────
+    if (IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT)) {
+        anyInput = true;
+        if (IsKeyDown(KEY_W)) rawGas = 1.0f;
+        if (IsKeyDown(KEY_S)) rawBrak = 1.0f;
+        if (IsKeyDown(KEY_A)) rawSteer = -1.0f;
+        if (IsKeyDown(KEY_D)) rawSteer = 1.0f;
+    }
+    
+    if (anyInput) controllerPriorityTimer = 2.0f;
+
+    if (controllerPriorityTimer > 0) controllerPriorityTimer -= dt;
+
+    // ── Keyboard ─────────────────────────────────────────────────────────────
+    if (controllerPriorityTimer <= 0.0f) {
+        if (IsKeyDown(KEY_W)) state.throttle += 1.0f;
+        if (IsKeyDown(KEY_S)) state.throttle -= 1.0f;
+        if (IsKeyDown(KEY_A)) state.steering -= 1.0f;
+        if (IsKeyDown(KEY_D)) state.steering += 1.0f;
+        if (IsKeyDown(KEY_SPACE)) state.brake = 1.0f;
+    } else {
+        // Controller taking over
+        state.steering = rawSteer;
+        state.brake = rawBrak;
+        // If braking heavily and not gassing, apply reverse throttle
+        if (rawBrak > 0.1f && rawGas < 0.1f) {
+            state.throttle = -rawBrak;
+        } else {
+            state.throttle = rawGas;
+        }
+    }
+
+    // Clamp values
+    if (state.throttle > 1.0f) state.throttle = 1.0f;
+    if (state.throttle < -1.0f) state.throttle = -1.0f;
+    if (state.steering > 1.0f) state.steering = 1.0f;
+    if (state.steering < -1.0f) state.steering = -1.0f;
 }
 
 // =============================================================================
@@ -633,9 +781,43 @@ static void ResetRig(const btVector3 wheelSpawns[4])
 // =============================================================================
 int main()
 {
+    ChangeDirectory("/Users/rajveersahay/C ++ test/Car-Racing-Game");
     InitWindow(1280, 720, "Physics Sandbox — Concrete + Suspended Tire Rig");
+    
     SetTargetFPS(60);
+    InitAudioDevice();
     InitBullet();
+
+    // =========================================================================
+    //  ENGINE AUDIO — Pseudo-Granular Blender
+    // =========================================================================
+    constexpr int ENG_SAMPLE_COUNT = 7;
+    const float   ENG_RPM_POINTS[ENG_SAMPLE_COUNT] = {
+        1500.f, 2000.f, 3000.f, 4000.f, 5000.f, 6000.f, 7000.f
+    };
+    const char*   ENG_FILES[ENG_SAMPLE_COUNT] = {
+        "Engine Sounds/Audi_1500_0_EXT.wav",
+        "Engine Sounds/Audi_2000_1_EXT.wav",
+        "Engine Sounds/Audi_3000_1_EXT.wav",
+        "Engine Sounds/Audi_4000_1_EXT.wav",
+        "Engine Sounds/Audi_5000_1_EXT.wav",
+        "Engine Sounds/Audi_6000_1_EXT.wav",
+        "Engine Sounds/Audi_7000_1_EXT.wav",
+    };
+
+    Sound engSounds[ENG_SAMPLE_COUNT];
+    for (int i = 0; i < ENG_SAMPLE_COUNT; i++) {
+        engSounds[i] = LoadSound(ENG_FILES[i]);
+        SetSoundVolume(engSounds[i], 0.0f);
+        PlaySound(engSounds[i]);
+    }
+
+    bool audioEnabled = true;
+    float currentRPM        = 1500.0f;
+    float rawRPM            = 1500.0f;
+    const float RPM_IDLE    = 1500.0f;
+    const float RPM_MAX     = 7000.0f;
+    const float RPM_OMEGA_SCALE = 220.0f;
 
     // ── Ground ───────────────────────────────────────────────────────────────
     {
@@ -644,7 +826,7 @@ int main()
         auto* b=MakeRigidBody(0.f,t,shape);
         // Ground friction = 1.0 so the tire's dynamic friction IS the contact friction.
         // (Bullet uses geometric mean: sqrt(1.0 * tire_friction) = tire_friction exactly)
-        b->setFriction(1.0f); b->setRestitution(0.04f);
+        b->setFriction(2.2f); b->setRestitution(0.24f);
     }
 
     // ── Concrete ramp ────────────────────────────────────────────────────────
@@ -714,7 +896,7 @@ int main()
         gCarBody.linDampHeld=0.15f; gCarBody.angDampHeld=0.90f;
         gCarBody.baseColor={55,65,75,255};  // dark steel
         gCarBody.label="CAR BODY  700 kg  (steel)";
-        if (!LoadPhysObj(gCarBody,"Obj Files/car.obj")) {
+        if (!LoadPhysObj(gCarBody,"Obj Files/car.obj", false, CAR_COM_OFFSET_Y, CAR_COM_OFFSET_Z)) {
             TraceLog(LOG_ERROR,"car.obj missing"); return 1;
         }
         // Car body has FULL collision — convex hull contacts the floor/objects normally.
@@ -727,6 +909,10 @@ int main()
         // SyncTransform reads gCarBody.body's world transform — so visual follows automatically.
         btTransform ct; gChassisBody->getMotionState()->getWorldTransform(ct);
         btVector3 physOff(CAR_PHYS_OFF_X, CAR_PHYS_OFF_Y, CAR_PHYS_OFF_Z);
+        
+        // Compensate for the COM shift so the visual body remains at the exact same location
+        physOff -= gCarBody.comOffset;
+        
         btTransform carInitT = ct;
         carInitT.setOrigin(ct.getOrigin() + ct.getBasis() * physOff);
         gCarBody.body->setWorldTransform(carInitT);
@@ -777,14 +963,119 @@ int main()
     int         hoverVI=-1;
     Vector3     hoverVW={0,0,0};
     bool        showBBox=false;   // [B] toggles physics AABB wireframe debug overlay
+    bool        showCOM =false;   // [V] toggles Center of Mass sphere
 
     // ==========================================================================
     //  GAME LOOP
     // ==========================================================================
+    InputState io;
     while (!WindowShouldClose())
     {
         float dt=GetFrameTime(); if(dt>0.05f)dt=0.05f;
+        PollInput(io, dt);
         float scroll=GetMouseWheelMove();
+
+        // =====================================================================
+        //  ENGINE RPM CALCULATION + AUDIO UPDATE
+        // =====================================================================
+        if (IsKeyPressed(KEY_M)) {
+            audioEnabled = !audioEnabled;
+            if (!audioEnabled) {
+                for (int i = 0; i < ENG_SAMPLE_COUNT; i++)
+                    SetSoundVolume(engSounds[i], 0.0f);
+            }
+        }
+
+        // Extract rear wheel spin to compute slip
+        btRigidBody* rbRL = gWheels[2].body;
+        btRigidBody* rbRR = gWheels[3].body;
+        btVector3 axleRL = rbRL->getWorldTransform().getBasis() * btVector3(1,0,0);
+        btVector3 axleRR = rbRR->getWorldTransform().getBasis() * btVector3(1,0,0);
+        float spinRL = (float)(rbRL->getAngularVelocity().dot(axleRL));
+        float spinRR = (float)(rbRR->getAngularVelocity().dot(axleRR));
+        float rearSpinOmega = (fabsf(spinRL) + fabsf(spinRR)) * 0.5f;
+        float wheelSpeedKmh = rearSpinOmega * gWheels[2].wheelRadius * 3.6f;
+
+        bool throttleOn = (io.throttle > 0.0f);
+        btTransform ctTgt; gChassisBody->getMotionState()->getWorldTransform(ctTgt);
+        btVector3 fwdTgt = ctTgt.getBasis() * btVector3(0.f,0.f,1.f);
+        float absSpeedKmh = fabsf((float)gChassisBody->getLinearVelocity().dot(fwdTgt)) * 3.6f;
+
+        float blipRPM = RPM_IDLE;
+        
+        if (throttleOn) {
+            // Gear simulation based on actual car speed instead of wheel spin
+            const float speedPerGear = 35.0f; // km/h per gear
+            int gear = (int)(absSpeedKmh / speedPerGear);
+            if (gear > 5) gear = 5; // max 6 gears
+            
+            // Add wheel slip to the effective speed to make engine rev higher when tires are spinning/drifting
+            float slipSpeedKmh = wheelSpeedKmh - absSpeedKmh;
+            if (slipSpeedKmh < 0.0f) slipSpeedKmh = 0.0f;
+            // 0.65x multiplier means spinning tires hard will bounce the RPM high into the rev range!
+            float effectiveSpeedKmh = absSpeedKmh + slipSpeedKmh * 0.65f;
+            
+            float speedInGear = effectiveSpeedKmh - (gear * speedPerGear);
+            float baseRPMForGear = (gear == 0) ? RPM_IDLE : 3800.0f;
+            
+            blipRPM = baseRPMForGear + (speedInGear / speedPerGear) * (RPM_MAX - baseRPMForGear);
+            
+            // Give it a minimum RPM purely based on throttle input so it sounds responsive immediately
+            float minThrottleRPM = RPM_IDLE + io.throttle * (RPM_MAX - RPM_IDLE) * 0.45f;
+            if (blipRPM < minThrottleRPM) blipRPM = minThrottleRPM;
+            
+        } else {
+            // When off throttle, simulate disengaged clutch or idle coasting
+            blipRPM = RPM_IDLE; 
+            // Clamp coastal RPM to something low so it sounds like it's idling
+            if (absSpeedKmh > 10.0f) blipRPM = 2200.0f; // fast idle when moving
+        }
+
+        if (blipRPM < RPM_IDLE) blipRPM = RPM_IDLE;
+        if (blipRPM > RPM_MAX ) blipRPM = RPM_MAX;
+        rawRPM = blipRPM;
+
+        float rpmRiseRate = 12.0f;
+        float rpmFallRate = 5.0f;
+        float rpmRate = (rawRPM > currentRPM) ? rpmRiseRate : rpmFallRate;
+        currentRPM += (rawRPM - currentRPM) * rpmRate * dt;
+
+        if (audioEnabled) {
+            int idxA = 0;
+            for (int i = 0; i < ENG_SAMPLE_COUNT - 1; i++) {
+                if (currentRPM >= ENG_RPM_POINTS[i]) idxA = i;
+                else break;
+            }
+            int idxB = idxA + 1;
+            if (idxB >= ENG_SAMPLE_COUNT) idxB = ENG_SAMPLE_COUNT - 1;
+
+            float rpmA = ENG_RPM_POINTS[idxA];
+            float rpmB = ENG_RPM_POINTS[idxB];
+            float span = rpmB - rpmA;
+            float t    = (span > 0.01f) ? (currentRPM - rpmA) / span : 0.0f;
+            if (t < 0.0f) t = 0.0f;
+            if (t > 1.0f) t = 1.0f;
+
+            float volA   = (1.0f - t);
+            float volB   = t;
+            float pitchA = (rpmA > 0.0f) ? (currentRPM / rpmA) : 1.0f;
+            float pitchB = (rpmB > 0.0f) ? (currentRPM / rpmB) : 1.0f;
+
+            for (int i = 0; i < ENG_SAMPLE_COUNT; i++) {
+                if (!IsSoundPlaying(engSounds[i])) PlaySound(engSounds[i]);
+
+                if (i == idxA && idxA != idxB) {
+                    SetSoundVolume(engSounds[i], volA * 0.85f);
+                    SetSoundPitch (engSounds[i], pitchA);
+                } else if (i == idxB) {
+                    float v = (idxA == idxB) ? 1.0f : volB;
+                    SetSoundVolume(engSounds[i], v * 0.85f);
+                    SetSoundPitch (engSounds[i], pitchB);
+                } else {
+                    SetSoundVolume(engSounds[i], 0.0f);
+                }
+            }
+        }
 
         // Camera orbit
         if (!isPicking) {
@@ -806,7 +1097,7 @@ int main()
         cam.projection=CAMERA_PERSPECTIVE;
 
         // Reset
-        if (IsKeyPressed(KEY_R)) {
+        if (io.reset) {
             if(pickedObj) ReleaseObj(*pickedObj,pickC);
             isPicking=false; pickedObj=nullptr;
             ResetPhysObj(gConcrete);
@@ -844,13 +1135,13 @@ int main()
             Vector2 md=GetMouseDelta();
             pickPivot+=btVector3(0,-md.y*0.033f,0);
             if(pickPivot.y()<0.05f)pickPivot.setY(0.05f);
-            // Arrow keys MOVE the held object in camera-relative XZ plane
+            // Arrow keys / D-Pad MOVE the held object in camera-relative XZ plane
             float spd=moveSpeed*dt;
             float cfX=sinf(yr),cfZ=cosf(yr),crX=cosf(yr),crZ=-sinf(yr);
-            if(IsKeyDown(KEY_UP))   {pickPivot-=btVector3(cfX*spd,0,cfZ*spd);}
-            if(IsKeyDown(KEY_DOWN)) {pickPivot+=btVector3(cfX*spd,0,cfZ*spd);}
-            if(IsKeyDown(KEY_LEFT)) {pickPivot-=btVector3(crX*spd,0,crZ*spd);}
-            if(IsKeyDown(KEY_RIGHT)){pickPivot+=btVector3(crX*spd,0,crZ*spd);}
+            if(io.pickMove.z() < -0.1f) {pickPivot-=btVector3(cfX*spd,0,cfZ*spd);}
+            if(io.pickMove.z() >  0.1f) {pickPivot+=btVector3(cfX*spd,0,cfZ*spd);}
+            if(io.pickMove.x() < -0.1f) {pickPivot-=btVector3(crX*spd,0,crZ*spd);}
+            if(io.pickMove.x() >  0.1f) {pickPivot+=btVector3(crX*spd,0,crZ*spd);}
             pickC->setPivotB(pickPivot);
             if (IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) {
                 ReleaseObj(*pickedObj,pickC);
@@ -858,16 +1149,13 @@ int main()
             }
         }
 
-        // ── Drive (WASD) + Steer (A/D) + Brake (SPACE) ─────────────────────────
-        // W = accelerate forward    S = reverse
-        // A = steer left            D = steer right
-        // SPACE = brake (ramps up progressively, applies counter-torque to all 4 wheels)
-        // Arrow keys = move held object (when mouse-picking something)
+        // ── Drive (WASD / Stick) + Steer (A/D / Stick) + Brake (SPACE / Trigger) ──
+        // W/Stick Up = accelerate forward    S/Stick Down = reverse
+        // A/Stick Left = steer left          D/Stick Right = steer right
+        // SPACE/LT = brake (ramps up progressively, applies counter-torque to all 4 wheels)
         {
             // — Rear-wheel drive —
-            float driveDir = 0.f;
-            if (IsKeyDown(KEY_W)) driveDir = +1.f;  // forward
-            if (IsKeyDown(KEY_S)) driveDir = -1.f;  // reverse
+            float driveDir = io.throttle;
             if (driveDir != 0.f) {
                 for (int wi = 2; wi <= 3; wi++) {
                     btRigidBody* wb   = gWheels[wi].body;
@@ -880,21 +1168,31 @@ int main()
                 gChassisBody->activate(true);
             }
 
-            // — Steering (A / D) —
-            float targetSteer = 0.f;
-            if (IsKeyDown(KEY_A)) targetSteer = -MAX_STEER;  // LEFT
-            if (IsKeyDown(KEY_D)) targetSteer = +MAX_STEER;  // RIGHT
-            steerAngle += (targetSteer - steerAngle) * STEER_BLEND;
+            // — Steering (Speed-sensitive + Smooth) —
+            btTransform ctTgtSt; gChassisBody->getMotionState()->getWorldTransform(ctTgtSt);
+            btVector3 fwdTgtSt = ctTgtSt.getBasis() * btVector3(0.f,0.f,1.f);
+            float absSpeedKmhSteer = fabsf((float)gChassisBody->getLinearVelocity().dot(fwdTgtSt)) * 3.6f;
+
+            float speedFactor  = 1.0f - P_STEER_SPEED_REDUCE * (absSpeedKmhSteer / 120.0f);
+            if (speedFactor < 0.23f) speedFactor = 0.23f;
+            float effectiveMax = MAX_STEER_ANGLE * speedFactor;
+
+            float targetSteer = io.steering * effectiveMax;
+            float steerRate = (fabsf(targetSteer) > 0.001f) ? P_STEER_IN_RATE : P_STEER_OUT_RATE;
+            steerAngle += (targetSteer - steerAngle) * steerRate * dt;
+
+            // Clamp
+            if (steerAngle >  effectiveMax) steerAngle =  effectiveMax;
+            if (steerAngle < -effectiveMax) steerAngle = -effectiveMax;
+
             if (gSusp[0]) gSusp[0]->setServoTarget(4, steerAngle);
             if (gSusp[1]) gSusp[1]->setServoTarget(4, steerAngle);
 
-            // — Progressive braking (SPACE) —
-            // brakeForce ramps 0→1 while held (full in ~10 frames), decays when released.
-            // Applies counter-torque to ALL 4 wheels proportional to brakeForce.
+            // — Progressive braking —
             const float BRAKE_RAMP_UP   = 0.18f;  // per frame rate of build-up
             const float BRAKE_RAMP_DOWN = 0.12f;  // per frame rate of release
-            if (IsKeyDown(KEY_SPACE)) {
-                brakeForce = fminf(brakeForce + BRAKE_RAMP_UP,   1.0f);
+            if (io.brake > 0.1f) {
+                brakeForce = fminf(brakeForce + BRAKE_RAMP_UP * io.brake, 1.0f);
             } else {
                 brakeForce = fmaxf(brakeForce - BRAKE_RAMP_DOWN, 0.0f);
             }
@@ -903,7 +1201,6 @@ int main()
                     btRigidBody* wb   = gWheels[wi].body;
                     btVector3    axle = wb->getWorldTransform().getBasis() * btVector3(1,0,0);
                     float currSpin    = (float)(wb->getAngularVelocity().dot(axle));
-                    // Counter-torque opposes current spin direction
                     if (fabsf(currSpin) > 0.01f)
                         wb->applyTorqueImpulse(axle * (-currSpin / fabsf(currSpin)) * (brakeForce * BRAKE_TORQUE * dt));
                     wb->activate(true);
@@ -1060,7 +1357,7 @@ int main()
                     btVector3 frontBt = cFwd * btCos(btScalar(steerAngle))
                                       - cRight * btSin(btScalar(steerAngle));
 
-                    bool driving = IsKeyDown(KEY_W) || IsKeyDown(KEY_S);
+                    bool driving = fabsf(io.throttle) > 0.1f;
 
                     for (int i = 0; i < 4; i++) {
                         btTransform wt; gWheels[i].body->getMotionState()->getWorldTransform(wt);
@@ -1069,7 +1366,7 @@ int main()
 
                         bool isRear  = (i >= 2);
                         bool isFront = !isRear;
-                        bool isSteering = isFront && (IsKeyDown(KEY_A)||IsKeyDown(KEY_D));
+                        bool isSteering = isFront && (fabsf(io.steering) > 0.1f);
 
                         // Pick which direction vector to use
                         btVector3 dir = isRear ? cFwd : frontBt;
@@ -1091,7 +1388,7 @@ int main()
                 // ── Physics AABB debug overlay (press B to toggle) ──────────────────
                 // Shows the Bullet AABB for every dynamic body in the world.
                 // Useful for diagnosing overlap / tunnelling issues.
-                if (IsKeyPressed(KEY_B)) showBBox = !showBBox;
+                if (io.toggleBBox) showBBox = !showBBox;
                 if (showBBox) {
                     int n = gWorld->getNumCollisionObjects();
                     for (int oi = 0; oi < n; oi++) {
@@ -1113,10 +1410,44 @@ int main()
                         }
                         DrawBoundingBox(bb, bc);
                     }
-                    DrawText("[B] BBOX DEBUG ON  (Red=CarBody  Green=Tire  Yellow=Chassis  Cyan=Concrete)",
-                        10, GetScreenHeight()-24, 12, {255,200,100,255});
-                } else {
-                    DrawText("[B] show bounding boxes", 10, GetScreenHeight()-24, 11, {120,120,140,180});
+                }
+
+                if (io.toggleCOM) showCOM = !showCOM;
+                if (showCOM) {
+                    // Calculate true combined Center of Mass of the entire car assembly
+                    btVector3 combinedCOM(0,0,0);
+                    float combinedMass = 0.0f;
+                    
+                    auto addBodyCOM = [&](btRigidBody* rb) {
+                        float m = (rb->getInvMass() > 0.0f) ? (1.0f / rb->getInvMass()) : 0.0f;
+                        if (m > 0.0f) {
+                            combinedCOM += rb->getCenterOfMassPosition() * m;
+                            combinedMass += m;
+                        }
+                    };
+                    
+                    addBodyCOM(gChassisBody);
+                    addBodyCOM(gCarBody.body);
+                    for (int wi = 0; wi < 4; wi++) addBodyCOM(gWheels[wi].body);
+                    
+                    if (combinedMass > 0.0f) {
+                        combinedCOM /= combinedMass;
+                        Vector3 vCOM = {(float)combinedCOM.x(), (float)combinedCOM.y(), (float)combinedCOM.z()};
+                        
+                        // Disable depth testing so the COM sphere renders "through" the car
+                        rlDisableDepthTest();
+                        
+                        // Draw a large magenta sphere at the true COM
+                        DrawSphere(vCOM, 0.25f, {255, 0, 255, 200});
+                        DrawSphereWires(vCOM, 0.25f, 8, 8, {255, 255, 255, 255});
+                        
+                        // Draw a line straight down to the ground to show where the weight rests
+                        DrawLine3D(vCOM, {vCOM.x, 0.0f, vCOM.z}, {255, 0, 255, 150});
+                        
+                        rlEnableDepthTest();
+                        
+                        // NOTE: The spheres will be drawn in 2D space after EndMode3D to guarantee X-Ray visibility
+                    }
                 }
 
             EndMode3D();
@@ -1135,12 +1466,35 @@ int main()
             PrintP(gWheels[2],98,{180,220,255,255});
             PrintP(gWheels[3],112,{180,220,255,255});
 
-            // Live tire data: slip% and friction for driven rear wheels
-            {
+                // --- GAMEPAD STATE (Top Right, no overlap) ---
+                int gpId = -1;
+                for (int i=0; i<15; i++) if (IsGamepadAvailable(i)) { gpId=i; break; }
+                if (gpId != -1) {
+                    int baseX = GetScreenWidth() - 250;
+                    int baseY = 50;
+                    DrawRectangle(baseX - 5, baseY - 5, 240, 150, {0,0,0,180}); 
+                    DrawText(TextFormat("HW: %s", GetGamepadName(gpId)), baseX, baseY, 10, {150, 255, 150, 255});
+                    DrawText(TextFormat("RAW SIGNAL TICK: %d", gRawSignalCount), baseX, baseY + 15, 12, ORANGE);
+                    
+                    for (int a=0; a<8; a++) {
+                        float v = GetGamepadAxisMovement(gpId, a);
+                        Color c = (fabsf(v) > 0.05f) ? GREEN : GRAY;
+                        DrawText(TextFormat("AX %d: [%.2f]", a, v), baseX + (a/4)*110, baseY + 35 + (a%4)*15, 11, c);
+                    }
+                    
+                    if (GetGamepadAxisCount(gpId) == 0) {
+                        DrawText("NO AXIS DATA - MAC OS PERMISSION DROP", baseX, baseY+70, 10, RED);
+                    }
+                }
+                else {
+                    int baseX = GetScreenWidth() - 250;
+                    int baseY = 50;
+                    DrawText("GAMEPAD: NONE DETECTED", baseX, baseY, 11, {255,100,100,200});
+                }
                 btTransform ct; gChassisBody->getMotionState()->getWorldTransform(ct);
                 btVector3 fwd = ct.getBasis() * btVector3(0.f,0.f,1.f);
                 float vCar = fabsf((float)gChassisBody->getLinearVelocity().dot(fwd));
-                int yRow = 128;
+                int yRow = 156;
                 DrawText("TIRE TELEMETRY", 10, yRow, 11, {160,255,160,200}); yRow+=14;
                 const char* wlabel[4]={"FL","FR","RL","RR"};
                 Color wcol[4]={{120,180,255,220},{120,180,255,220},{80,255,80,220},{80,255,80,220}};
@@ -1158,7 +1512,7 @@ int main()
                 }
                 DrawText(TextFormat("car speed: %.1f m/s (%.0f km/h)",vCar,vCar*3.6f),
                     10,yRow,11,{200,200,255,200});
-            }
+
 
             if (isPicking&&pickedObj){
                 bool isC=(pickedObj==&gConcrete);
@@ -1170,13 +1524,56 @@ int main()
                     10,146,13,isC?Color{255,200,100,255}:Color{80,200,255,255});
             }
 
-            int ly=GetScreenHeight()-84;
-            DrawText("Arrow UP/DN  — rear wheels spin (RWD friction drives car fwd/back)",10,ly,   13,{120,220,120,255});
-            DrawText("Arrow L/R   — steer chassis yaw (whole rig turns)",               10,ly+16,13,{120,200,200,255});
-            DrawText("LMB click = grab vertex  |  drag up/dn = height  |  WASD = slide", 10,ly+32,13,{160,160,160,255});
-            DrawText("Spring lines: GREEN=rest  RED=compressed  BLUE=extended",           10,ly+48,13,{100,180,100,200});
-            DrawText("Arrows on tires = forward direction  |  BRIGHT GREEN = driven ring",10,ly+64,13,{100,180,100,180});
-            DrawText("RMB = orbit  |  Scroll = zoom  |  R = reset all",                  10,ly+80,13,{160,160,160,255});
+            int ly=GetScreenHeight()-142;
+            DrawText("WASD / Left Stick  — drive & steer (RWD friction drives car)", 10, ly,    13, {120,220,120,255});
+            DrawText("SPACE / L-Trigger  — progressive braking",                    10, ly+16, 13, {255,160,160,255});
+            DrawText("LMB / D-Pad        — grab vertex & move held object",         10, ly+32, 13, {160,160,160,255});
+            DrawText("R / Gamepad Y      — reset rig",                              10, ly+48, 13, {160,160,160,255});
+            DrawText("Spring lines: GREEN=rest  RED=compressed  BLUE=extended",       10, ly+64, 13, {100,180,100,200});
+            DrawText("RMB = orbit  |  Scroll = zoom",                                 10, ly+80, 13, {160,160,160,255});
+            DrawText("M = Toggle engine audio",                                       10, ly+96, 13, audioEnabled ? Color{100,255,100,255} : Color{255,80,80,255});
+            
+            if (showBBox) DrawText("B / Gamepad X — BBOX DEBUG ON",                   10, ly+112, 13, {255,200,100,255});
+            else          DrawText("B / Gamepad X — show bounding boxes",             10, ly+112, 13, {120,120,140,180});
+            
+            if (showCOM)  DrawText("V — COM VISUALIZER ON (Magenta = True Center)",   10, ly+128, 13, {255,100,255,255});
+            else          DrawText("V — show combined center of mass",                10, ly+128, 13, {120,120,140,180});
+
+            // Draw the 2D Center of Mass Overlay
+            if (showCOM) {
+                btVector3 combinedCOM(0,0,0);
+                float combinedMass = 0.0f;
+                auto addBodyCOM = [&](btRigidBody* rb) {
+                    float m = (rb->getInvMass() > 0.0f) ? (1.0f / rb->getInvMass()) : 0.0f;
+                    if (m > 0.0f) { combinedCOM += rb->getCenterOfMassPosition() * m; combinedMass += m; }
+                };
+                addBodyCOM(gChassisBody); addBodyCOM(gCarBody.body);
+                for (int wi = 0; wi < 4; wi++) addBodyCOM(gWheels[wi].body);
+                
+                if (combinedMass > 0.0f) {
+                    combinedCOM /= combinedMass;
+                    Vector3 vCOM = {(float)combinedCOM.x(), (float)combinedCOM.y(), (float)combinedCOM.z()};
+                    Vector2 screenPos = GetWorldToScreen(vCOM, cam);
+                    
+                    DrawCircleV(screenPos, 8.0f, {255, 0, 255, 220});
+                    DrawRing(screenPos, 10.0f, 13.0f, 0, 360.0f, 16, {255, 255, 255, 220});
+                    DrawLine(screenPos.x - 20, screenPos.y, screenPos.x + 20, screenPos.y, {255, 255, 255, 150});
+                    DrawLine(screenPos.x, screenPos.y - 20, screenPos.x, screenPos.y + 20, {255, 255, 255, 150});
+                }
+            }
+
+            // RPM Gauge
+            float rpmFrac = (currentRPM - RPM_IDLE) / (RPM_MAX - RPM_IDLE);
+            if (rpmFrac < 0.0f) rpmFrac = 0.0f;
+            if (rpmFrac > 1.0f) rpmFrac = 1.0f;
+            Color rpmCol;
+            if (rpmFrac < 0.6f)       rpmCol = {80, 220, 80, 255};
+            else if (rpmFrac < 0.85f) rpmCol = {255, 200, 0, 255};
+            else                       rpmCol = {255, 50, 50, 255};
+
+            DrawText(TextFormat("RPM       : %5.0f", currentRPM), 10, 15, 16, rpmCol);
+            DrawRectangle(160, 17, 200, 14, {40,40,40,200});
+            DrawRectangle(160, 17, (int)(rpmFrac * 200), 14, rpmCol);
 
         EndDrawing();
     }
@@ -1194,6 +1591,11 @@ int main()
         gWorld->removeCollisionObject(o);delete o;
     }
     delete gWorld;delete gSolver;delete gBroadphase;delete gDispatcher;delete gCollCfg;
+    for (int i = 0; i < ENG_SAMPLE_COUNT; i++) {
+        StopSound(engSounds[i]);
+        UnloadSound(engSounds[i]);
+    }
+    CloseAudioDevice();
     CloseWindow();
     return 0;
 }
