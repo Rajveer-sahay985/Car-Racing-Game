@@ -127,7 +127,8 @@ static StaticTrimesh MakeRampObstacle(const char* objFile, Shader sh,
                 btVector3 v0(vp[i0*3+0], vp[i0*3+1], vp[i0*3+2]);
                 btVector3 v1(vp[i1*3+0], vp[i1*3+1], vp[i1*3+2]);
                 btVector3 v2(vp[i2*3+0], vp[i2*3+1], vp[i2*3+2]);
-                obs.triData->addTriangle(v0, v1, v2);
+                obs.triData->addTriangle(v0, v1, v2);        // front face
+                obs.triData->addTriangle(v2, v1, v0);        // back face  (double-sided)
             }
         } else {
             // Non-indexed: every 3 vertices = 1 triangle
@@ -136,7 +137,8 @@ static StaticTrimesh MakeRampObstacle(const char* objFile, Shader sh,
                 btVector3 v0(vp[b+0], vp[b+1], vp[b+2]);
                 btVector3 v1(vp[b+3], vp[b+4], vp[b+5]);
                 btVector3 v2(vp[b+6], vp[b+7], vp[b+8]);
-                obs.triData->addTriangle(v0, v1, v2);
+                obs.triData->addTriangle(v0, v1, v2);        // front face
+                obs.triData->addTriangle(v2, v1, v0);        // back face  (double-sided)
             }
         }
     }
@@ -476,6 +478,9 @@ int main()
         { 0.0f, 0.0f, 0.0f },          // NO offset — honour the Blender world position
         { 200, 200, 210, 255 }          // light grey-blue tint
     );
+
+    // B key: toggle physics debug bounding-box visualizer
+    bool showDebug = false;
 
     // =========================================================================
     //  PHYSICS INPUT STATE
@@ -965,6 +970,9 @@ int main()
             engineSmoothed = 0.0f;
         }
 
+        // B KEY: toggle physics AABB debug visualizer
+        if (IsKeyPressed(KEY_B)) showDebug = !showDebug;
+
         // =====================================================================
         //  ACTIVE ANTI-ROLL TORQUE
         //  Reads the car's current up vector and applies a corrective torque
@@ -1068,11 +1076,12 @@ int main()
         chassis->getMotionState()->getWorldTransform(chassisTrans);
 
         btVector3 origin = chassisTrans.getOrigin();
-        // We use the GROUND-LEVEL x/z; for y we subtract chassis half-extent
-        // so the car renders at the same visual height as Step 0.
+        // carPos.y = chassis centre Y relative to flat-ground rest height (0.80m).
+        // On flat ground: origin.y ≈ 0.80 → carPos.y = 0 → no change from before.
+        // On a ramp:      origin.y rises  → carPos.y > 0 → car visual follows physics up.
         carPos = {
             (float)origin.x(),
-            0.0f,               // drive the render as if flat — suspension bob is subtle
+            (float)origin.y() - 0.80f,   // relative height: 0 on flat ground, +ve on ramp
             (float)origin.z()
         };
 
@@ -1306,7 +1315,7 @@ int main()
                         MatrixRotateY(heading)
                     ),
                     MatrixTranslate(carPos.x,
-                                   P_CHASSIS_Y_OFFSET + vibration,
+                                   carPos.y + P_CHASSIS_Y_OFFSET + vibration,
                                    carPos.z)
                 );
 
@@ -1331,7 +1340,7 @@ int main()
                         MatrixRotateZ(wheelLean),
                         MatrixRotateY(heading)
                     ),
-                    MatrixTranslate(carPos.x, 0.0f, carPos.z)  // wheels always at ground (y=0)
+                    MatrixTranslate(carPos.x, carPos.y, carPos.z)  // wheels follow chassis height
                 );
 
                 // --- Wheels: front use wheelSpin (FL, index 0), rear use rearWheelSpin ---
@@ -1354,15 +1363,66 @@ int main()
                 DrawModel(carModel, {0,0,0}, 1.0f, WHITE);
 
                 // --- Runway ramp ---
-                // Apply Transform was baked in Blender, so vertices are in OBJ-local space.
-                // We translate by runway.offset to place it in the correct world position,
-                // matching the btBvhTriangleMeshShape rigid body transform.
                 runway.model.transform = MatrixTranslate(
                     runway.offset.x, runway.offset.y, runway.offset.z);
                 DrawModel(runway.model, {0,0,0}, 1.0f, runway.tint);
-
-                // Ramp outline for visibility (wireframe-style edge)
                 DrawModelWires(runway.model, {0,0,0}, 1.0f, {120, 120, 140, 80});
+
+                // =====================================================================
+                //  DEBUG: Physics AABB Visualizer  (toggle with B key)
+                //  CYAN   = car chassis AABB  (where Bullet thinks the car box IS)
+                //  YELLOW = runway trimesh AABB
+                //  MAGENTA= wheel centre spheres  (actual suspension contact origin)
+                //  RED    = active ground contact point per wheel
+                //  ORANGE = ground plane reference line at Y=0
+                // =====================================================================
+                if (showDebug) {
+                    // --- Car chassis AABB ---
+                    btVector3 cMin, cMax;
+                    chassis->getCollisionShape()->getAabb(
+                        chassis->getWorldTransform(), cMin, cMax);
+                    DrawBoundingBox({
+                        {(float)cMin.x(),(float)cMin.y(),(float)cMin.z()},
+                        {(float)cMax.x(),(float)cMax.y(),(float)cMax.z()}},
+                        SKYBLUE);
+
+                    // --- Runway trimesh AABB ---
+                    btVector3 rMin, rMax;
+                    runway.shape->getAabb(
+                        runway.body->getWorldTransform(), rMin, rMax);
+                    DrawBoundingBox({
+                        {(float)rMin.x(),(float)rMin.y(),(float)rMin.z()},
+                        {(float)rMax.x(),(float)rMax.y(),(float)rMax.z()}},
+                        YELLOW);
+
+                    // --- Wheel spheres + contact points ---
+                    for (int wi = 0; wi < 4; wi++) {
+                        vehicle->updateWheelTransform(wi, true);
+                        const btWheelInfo& wInfo = vehicle->getWheelInfo(wi);
+
+                        // Wheel centre (where the axle is)
+                        btVector3 wc = wInfo.m_worldTransform.getOrigin();
+                        DrawSphere({(float)wc.x(),(float)wc.y(),(float)wc.z()},
+                                   0.08f, MAGENTA);
+
+                        // Ground contact point (where the wheel touches)
+                        if (wInfo.m_raycastInfo.m_isInContact) {
+                            btVector3 cp = wInfo.m_raycastInfo.m_contactPointWS;
+                            DrawSphere({(float)cp.x(),(float)cp.y(),(float)cp.z()},
+                                       0.06f, RED);
+                        }
+                    }
+
+                    // --- Y=0 ground plane reference box (shows where ground IS) ---
+                    DrawBoundingBox({{-30.f,-0.02f,-30.f},{30.f,0.02f,30.f}},
+                                    {255,140,0,180});
+
+                    // --- Debug text overlay ---
+                    DrawText("[DEBUG PHYSICS ON]", 10, GetScreenHeight()-115, 14,
+                             {100,255,255,255});
+                    DrawText("CYAN=Chassis  YELLOW=Ramp  MAGENTA=Wheels  RED=Contact",
+                             10, GetScreenHeight()-98, 12, {200,200,200,200});
+                }
 
 
             EndMode3D();
@@ -1409,8 +1469,8 @@ int main()
                 10, 98, 15,
                 handbrake ? Color{255,50,50,255} : Color{160,180,255,255});
 
-            DrawText("SPACE: Handbrake  |  R: Reset  |  M: Mute", 10, 118, 14, {150,150,150,255});
-
+            DrawText("SPACE: Handbrake  |  R: Reset  |  M: Mute  |  B: Debug",
+                     10, 118, 14, {150,150,150,255});
 
             int y = GetScreenHeight() - 90;
             DrawText("W/S  : Throttle / Brake+Reverse", 10, y,    15, {180,180,180,255});
