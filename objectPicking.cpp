@@ -638,7 +638,8 @@ static void DrawVtxViz(const PhysicsObj& obj, int hVI, Vector3 hVW,
 //  SCENE GLOBALS
 // =============================================================================
 static PhysicsObj gConcrete;
-static PhysicsObj gCarBody;                            // visible steel car chassis
+static PhysicsObj gCarBody;                            // physics collider cage
+static Model gCarVisualModel;                          // visual only model
 static PhysicsObj gWheels[4];                          // FL FR RL RR
 static btRigidBody*                  gChassisBody=nullptr;  // invisible chassis frame
 static btCollisionShape*             gChassisShape=nullptr;
@@ -963,11 +964,12 @@ int main()
         gCarBody.mass=CAR_BODY_MASS; gCarBody.friction=0.40f; gCarBody.restitution=0.10f;
         gCarBody.linDamp=0.05f; gCarBody.angDamp=0.20f;
         gCarBody.linDampHeld=0.15f; gCarBody.angDampHeld=0.90f;
-        gCarBody.baseColor={55,65,75,255};  // dark steel
-        gCarBody.label="CAR BODY  700 kg  (steel)";
-        if (!LoadPhysObj(gCarBody,"Obj Files/car.obj", false, CAR_COM_OFFSET_Y, CAR_COM_OFFSET_Z)) {
-            TraceLog(LOG_ERROR,"car.obj missing"); return 1;
+        gCarBody.baseColor={255,0,0,100};  // semi-transparent red cage
+        gCarBody.label="CAR BODY  700 kg  (cage physics)";
+        if (!LoadPhysObj(gCarBody,"Obj Files/cage.obj", false, CAR_COM_OFFSET_Y, CAR_COM_OFFSET_Z)) {
+            TraceLog(LOG_ERROR,"cage.obj missing"); return 1;
         }
+        gCarVisualModel = LoadModel("Obj Files/car.obj");
         // Car body has FULL collision — convex hull contacts the floor/objects normally.
         // During normal driving it sits above the wheels so no floor contact occurs.
         // When flipped, it correctly rests on the ground instead of clipping through.
@@ -1044,6 +1046,9 @@ int main()
     for (int m=0; m<gCarBody.model.materialCount; m++) {
         gCarBody.model.materials[m].shader = lightingShader;
     }
+    for (int m=0; m<gCarVisualModel.materialCount; m++) {
+        gCarVisualModel.materials[m].shader = lightingShader;
+    }
 
     // ==========================================================================
     //  DAMAGE SYSTEM STATE
@@ -1055,7 +1060,8 @@ int main()
     };
     std::vector<HitMarker> hitMarkers;
     float carDamage = 0.0f;
-    bool showDamageVis = true;
+    bool showDamageVis = false;
+    bool showCageVis = false;
 
     // ==========================================================================
     //  GAME LOOP
@@ -1071,6 +1077,7 @@ int main()
         //  ENGINE RPM CALCULATION + AUDIO UPDATE
         // =====================================================================
         if (IsKeyPressed(KEY_I)) showDamageVis = !showDamageVis;
+        if (IsKeyPressed(KEY_O)) showCageVis = !showCageVis;
         if (IsKeyPressed(KEY_M)) {
             audioEnabled = !audioEnabled;
             if (!audioEnabled) {
@@ -1490,7 +1497,14 @@ int main()
                             gCarBody.model.transform);
                     Matrix savedT = gCarBody.model.transform;
                     gCarBody.model.transform = carLocal;
-                    DrawModel(gCarBody.model,{0,0,0},1.f,WHITE);   // show texture
+                    
+                    if (showCageVis) {
+                        DrawModelWires(gCarBody.model, {0,0,0}, 1.f, GREEN);
+                    }
+                    
+                    gCarVisualModel.transform = carLocal;
+                    DrawModel(gCarVisualModel,{0,0,0},1.f,WHITE);   // show texture
+                    
                     gCarBody.model.transform = savedT;
                 }
 
@@ -1736,6 +1750,7 @@ int main()
             DrawText("RMB = orbit  |  Scroll = zoom",                                 10, ly+80, 13, {160,160,160,255});
             DrawText("M = Toggle engine audio",                                       10, ly+96, 13, audioEnabled ? Color{100,255,100,255} : Color{255,80,80,255});
             DrawText("I — Toggle 3D Damage Hit Markers",                              10, ly+160, 13, showDamageVis ? Color{255,100,100,255} : Color{120,120,140,180});
+            DrawText("O — Toggle Physics Cage Visibility",                            10, ly+176, 13, showCageVis ? Color{255,100,100,255} : Color{120,120,140,180});
             
             if (showBBox) DrawText("B / Gamepad X — BBOX DEBUG ON",                   10, ly+112, 13, {255,200,100,255});
             else          DrawText("B / Gamepad X — show bounding boxes",             10, ly+112, 13, {120,120,140,180});
@@ -1804,6 +1819,7 @@ int main()
     DestroySuspension();
     for(int i=0;i<nObjs;i++){UnloadModel(allObjs[i]->model);delete allObjs[i]->shape;}
     UnloadModel(gCarBody.model); delete gCarBody.shape;
+    UnloadModel(gCarVisualModel);
     for(int i=gWorld->getNumCollisionObjects()-1;i>=0;i--){
         btCollisionObject* o=gWorld->getCollisionObjectArray()[i];
         btRigidBody* b=btRigidBody::upcast(o);
