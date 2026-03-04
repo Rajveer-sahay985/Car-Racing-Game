@@ -863,6 +863,25 @@ int main()
     }
 
     bool audioEnabled = true;
+
+    // =========================================================================
+    //  IMPACT AUDIO
+    // =========================================================================
+    const char* IMPACT_FILES[] = {
+        "Engine Sounds/Impact Sounds/Bumper.wav",      // 0
+        "Engine Sounds/Impact Sounds/HardMetal1.wav",  // 1
+        "Engine Sounds/Impact Sounds/HardMetal2.wav",  // 2
+        "Engine Sounds/Impact Sounds/Lights.wav",      // 3
+        "Engine Sounds/Impact Sounds/MedMetal1.wav",   // 4
+        "Engine Sounds/Impact Sounds/MedMetal2.wav",   // 5
+        "Engine Sounds/Impact Sounds/Slide.wav",       // 6
+        "Engine Sounds/Impact Sounds/Tyre1.wav",       // 7
+        "Engine Sounds/Impact Sounds/Tyre2.wav"        // 8
+    };
+    constexpr int IMPACT_COUNT = sizeof(IMPACT_FILES)/sizeof(IMPACT_FILES[0]);
+    Sound impactSounds[IMPACT_COUNT];
+    for (int i=0; i<IMPACT_COUNT; i++) impactSounds[i] = LoadSound(IMPACT_FILES[i]);
+    float lastImpactSoundTime = 0.0f;
     float currentRPM        = 1500.0f;
     float rawRPM            = 1500.0f;
     const float RPM_IDLE    = 1500.0f;
@@ -1027,6 +1046,18 @@ int main()
     }
 
     // ==========================================================================
+    //  DAMAGE SYSTEM STATE
+    // ==========================================================================
+    struct HitMarker {
+        Vector3 pos;
+        float time;
+        float strength;
+    };
+    std::vector<HitMarker> hitMarkers;
+    float carDamage = 0.0f;
+    bool showDamageVis = true;
+
+    // ==========================================================================
     //  GAME LOOP
     // ==========================================================================
     InputState io;
@@ -1039,6 +1070,7 @@ int main()
         // =====================================================================
         //  ENGINE RPM CALCULATION + AUDIO UPDATE
         // =====================================================================
+        if (IsKeyPressed(KEY_I)) showDamageVis = !showDamageVis;
         if (IsKeyPressed(KEY_M)) {
             audioEnabled = !audioEnabled;
             if (!audioEnabled) {
@@ -1336,6 +1368,83 @@ int main()
         // Physics
         gWorld->stepSimulation(dt,10,1.f/120.f);
 
+        // ── Damage detection from collision manifolds ─────────────────────────
+        int numManifolds = gWorld->getDispatcher()->getNumManifolds();
+        for (int i = 0; i < numManifolds; i++) {
+            btPersistentManifold* contactManifold = gWorld->getDispatcher()->getManifoldByIndexInternal(i);
+            const btCollisionObject* obA = contactManifold->getBody0();
+            const btCollisionObject* obB = contactManifold->getBody1();
+            
+            bool isCarA = (obA == gChassisBody || obA == gCarBody.body);
+            bool isCarB = (obB == gChassisBody || obB == gCarBody.body);
+            bool isWheelA = false, isWheelB = false;
+            for(int w=0; w<4; w++) {
+                if(obA == gWheels[w].body) isWheelA = true;
+                if(obB == gWheels[w].body) isWheelB = true;
+            }
+            
+            bool isAssemblyA = isCarA || isWheelA;
+            bool isAssemblyB = isCarB || isWheelB;
+            
+            // Register hits if any part of the car assembly hits something that is NOT part of the car assembly
+            if ((isAssemblyA && !isAssemblyB) || (isAssemblyB && !isAssemblyA)) {
+                int numContacts = contactManifold->getNumContacts();
+                for (int j = 0; j < numContacts; j++) {
+                    btManifoldPoint& pt = contactManifold->getContactPoint(j);
+                    if (pt.getDistance() <= 0.0f) {
+                        float impulse = pt.m_appliedImpulse;
+                        const btCollisionObject* hitObj = isAssemblyA ? obA : obB;
+                        bool isChassisHit = (hitObj == gChassisBody || hitObj == gCarBody.body);
+                        
+                        // Tires bear the 1500kg car weight constantly, generating ~60-80 impulse every physics frame 
+                        // just from resting gravity. We need a much higher threshold for tires so they only trigger
+                        // on actual hard landings or jumps, whereas the chassis touching anything is always a hit.
+                        float hitThreshold = isChassisHit ? 30.0f : 250.0f;
+                        
+                        if (impulse > hitThreshold) { 
+                            carDamage += impulse * 0.005f;
+                            if (carDamage > 100.0f) carDamage = 100.0f;
+                            
+                            btVector3 btPos = isAssemblyA ? pt.getPositionWorldOnA() : pt.getPositionWorldOnB();
+                            
+                            // Audio Triggering Logic
+                            if (GetTime() - lastImpactSoundTime > 0.15f) { // Debounce extremely fast consecutive contacts
+                                int sIdx = 0;
+                                if (isChassisHit) {
+                                    if (impulse > 400.f) sIdx = GetRandomValue(1, 2); // HardMetal
+                                    else if (impulse > 80.f) sIdx = GetRandomValue(4, 5); // MedMetal
+                                    else sIdx = 0; // Bumper
+                                } else {
+                                    sIdx = GetRandomValue(7, 8); // Tyre
+                                }
+                                PlaySound(impactSounds[sIdx]);
+                                lastImpactSoundTime = GetTime();
+                            }
+
+                            // Add a new visual marker if it's far enough from recent world pos
+                            bool skip = false;
+                            for (auto& m : hitMarkers) {
+                                float dx = m.pos.x - (float)btPos.x();
+                                float dy = m.pos.y - (float)btPos.y();
+                                float dz = m.pos.z - (float)btPos.z();
+                                if ((dx*dx + dy*dy + dz*dz) < 1.0f && m.time > 1.8f) { skip = true; break; }
+                            }
+                            if (!skip) {
+                                hitMarkers.push_back({{ (float)btPos.x(), (float)btPos.y(), (float)btPos.z() }, 2.0f, impulse});
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        // Update hit markers lifespan
+        for (auto it = hitMarkers.begin(); it != hitMarkers.end(); ) {
+            it->time -= dt;
+            if (it->time <= 0.0f) it = hitMarkers.erase(it);
+            else ++it;
+        }
+
         // Sync
         for(int i=0;i<nObjs;i++) SyncTransform(*allObjs[i]);
         SyncTransform(gCarBody);   // car body welded to chassis — sync its visual too
@@ -1527,6 +1636,23 @@ int main()
                     }
                 }
 
+                // ── Draw Hit Markers (Damage spheres) ─────────────────────
+                if (showDamageVis) {
+                    rlDisableDepthTest(); // Draw over geometry to clearly see where hits happened
+                    for (const auto& m : hitMarkers) {
+                        float lifeSq = (m.time / 2.0f); // 1.0 to 0.0
+                        if (lifeSq < 0.0f) lifeSq = 0.0f;
+                        unsigned char alpha = (unsigned char)(lifeSq * 200.0f);
+                        float size = 0.2f + (m.strength * 0.0002f);
+                        if (size > 1.0f) size = 1.0f;
+                        
+                        float pulseRadius = size + (1.0f - lifeSq) * 1.5f; // Expands over time
+                        DrawSphere(m.pos, pulseRadius, {255, 50, 50, alpha});
+                        DrawSphereWires(m.pos, pulseRadius, 8, 8, {255, 100, 100, alpha});
+                    }
+                    rlEnableDepthTest();
+                }
+
             EndMode3D();
 
             // HUD
@@ -1609,6 +1735,7 @@ int main()
             DrawText("Spring lines: GREEN=rest  RED=compressed  BLUE=extended",       10, ly+64, 13, {100,180,100,200});
             DrawText("RMB = orbit  |  Scroll = zoom",                                 10, ly+80, 13, {160,160,160,255});
             DrawText("M = Toggle engine audio",                                       10, ly+96, 13, audioEnabled ? Color{100,255,100,255} : Color{255,80,80,255});
+            DrawText("I — Toggle 3D Damage Hit Markers",                              10, ly+160, 13, showDamageVis ? Color{255,100,100,255} : Color{120,120,140,180});
             
             if (showBBox) DrawText("B / Gamepad X — BBOX DEBUG ON",                   10, ly+112, 13, {255,200,100,255});
             else          DrawText("B / Gamepad X — show bounding boxes",             10, ly+112, 13, {120,120,140,180});
@@ -1654,10 +1781,24 @@ int main()
             DrawRectangle(160, 17, 200, 14, {40,40,40,200});
             DrawRectangle(160, 17, (int)(rpmFrac * 200), 14, rpmCol);
 
+            // Damage Gauge
+            float dmgFrac = carDamage / 100.0f;
+            if (dmgFrac > 1.0f) dmgFrac = 1.0f;
+            Color dmgCol = {80, 220, 80, 255}; // Green
+            if (dmgFrac > 0.3f) dmgCol = {255, 200, 0, 255}; // Yellow
+            if (dmgFrac > 0.7f) dmgCol = {255, 50, 50, 255}; // Red
+            
+            DrawText(TextFormat("DAMAGE    : %5.0f%%", carDamage), 10, 35, 16, dmgCol);
+            DrawRectangle(160, 37, 200, 14, {40,40,40,200});
+            DrawRectangle(160, 37, (int)(dmgFrac * 200), 14, dmgCol);
+
+
+
         EndDrawing();
     }
 
     // Cleanup
+    for (int i=0; i<IMPACT_COUNT; i++) UnloadSound(impactSounds[i]);
     if(pickC){gWorld->removeConstraint(pickC);delete pickC;}
     if(gCarWeldC){gWorld->removeConstraint(gCarWeldC);delete gCarWeldC; gCarWeldC=nullptr;}
     DestroySuspension();
