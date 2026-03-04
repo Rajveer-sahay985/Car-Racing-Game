@@ -640,6 +640,22 @@ static void DrawVtxViz(const PhysicsObj& obj, int hVI, Vector3 hVW,
 static PhysicsObj gConcrete;
 static PhysicsObj gCarBody;                            // physics collider cage
 static Model gCarVisualModel;                          // visual only model
+
+// =============================================================================
+//  VERTEX DEFORMATION GLOBALS
+// =============================================================================
+static std::vector<Vector3> gCageNodesOrig;            // pure simplified vertices
+static std::vector<Vector3> gCageNodesCur;             // deformed runtime vertices
+struct VisBind {
+    int meshIdx;
+    int vertIdx;
+    int cageNodeIdx;
+    Vector3 offset;
+};
+static std::vector<VisBind> gCarVisualBinds;
+static std::vector<VisBind> gCageVisualBinds;
+static bool gCarDeformed = false;
+
 static PhysicsObj gWheels[4];                          // FL FR RL RR
 static btRigidBody*                  gChassisBody=nullptr;  // invisible chassis frame
 static btCollisionShape*             gChassisShape=nullptr;
@@ -753,6 +769,67 @@ static void DestroySuspension()
         gWorld->removeRigidBody(gChassisBody); delete gChassisBody; gChassisBody=nullptr;
     }
     delete gChassisShape; gChassisShape=nullptr;
+}
+
+// =============================================================================
+//  VERTEX DEFORMATION INITIALIZATION
+// =============================================================================
+static void InitDeformationBindings() {
+    gCageNodesOrig.clear();
+    gCageNodesCur.clear();
+    gCarVisualBinds.clear();
+    gCageVisualBinds.clear();
+
+    // 1. Extract unique vertices from cage.obj model
+    for (int mi = 0; mi < gCarBody.model.meshCount; mi++) {
+        Mesh& m = gCarBody.model.meshes[mi];
+        for (int vi = 0; vi < m.vertexCount; vi++) {
+            Vector3 v = { m.vertices[vi*3], m.vertices[vi*3+1], m.vertices[vi*3+2] };
+            // Check for duplicates
+            bool dup = false;
+            for (const auto& existing : gCageNodesOrig) {
+                if (Vector3Distance(existing, v) < 0.001f) {
+                    dup = true; break;
+                }
+            }
+            if (!dup) gCageNodesOrig.push_back(v);
+        }
+    }
+    gCageNodesCur = gCageNodesOrig; // initially undeformed
+
+    // 2. Bind visual car model vertices
+    for (int mi = 0; mi < gCarVisualModel.meshCount; mi++) {
+        Mesh& m = gCarVisualModel.meshes[mi];
+        for (int vi = 0; vi < m.vertexCount; vi++) {
+            Vector3 v = { m.vertices[vi*3], m.vertices[vi*3+1], m.vertices[vi*3+2] };
+            float minDist = 1e30f; int bestIdx = 0;
+            for (int i = 0; i < (int)gCageNodesOrig.size(); i++) {
+                float d = Vector3Distance(v, gCageNodesOrig[i]);
+                if (d < minDist) { minDist = d; bestIdx = i; }
+            }
+            VisBind bind;
+            bind.meshIdx = mi; bind.vertIdx = vi; bind.cageNodeIdx = bestIdx;
+            bind.offset = Vector3Subtract(v, gCageNodesOrig[bestIdx]);
+            gCarVisualBinds.push_back(bind);
+        }
+    }
+
+    // 3. Bind cage wireframe model vertices (so the green overlay crushes too)
+    for (int mi = 0; mi < gCarBody.model.meshCount; mi++) {
+        Mesh& m = gCarBody.model.meshes[mi];
+        for (int vi = 0; vi < m.vertexCount; vi++) {
+            Vector3 v = { m.vertices[vi*3], m.vertices[vi*3+1], m.vertices[vi*3+2] };
+            float minDist = 1e30f; int bestIdx = 0;
+            for (int i = 0; i < (int)gCageNodesOrig.size(); i++) {
+                float d = Vector3Distance(v, gCageNodesOrig[i]);
+                if (d < minDist) { minDist = d; bestIdx = i; }
+            }
+            VisBind bind;
+            bind.meshIdx = mi; bind.vertIdx = vi; bind.cageNodeIdx = bestIdx;
+            bind.offset = Vector3Subtract(v, gCageNodesOrig[bestIdx]);
+            gCageVisualBinds.push_back(bind);
+        }
+    }
 }
 
 // Reset the full rig: chassis + all 4 wheels
@@ -970,6 +1047,9 @@ int main()
             TraceLog(LOG_ERROR,"cage.obj missing"); return 1;
         }
         gCarVisualModel = LoadModel("Obj Files/car.obj");
+        
+        InitDeformationBindings();
+        
         // Car body has FULL collision — convex hull contacts the floor/objects normally.
         // During normal driving it sits above the wheels so no floor contact occurs.
         // When flipped, it correctly rests on the ground instead of clipping through.
@@ -1414,6 +1494,37 @@ int main()
                             
                             btVector3 btPos = isAssemblyA ? pt.getPositionWorldOnA() : pt.getPositionWorldOnB();
                             
+                            // ── VERTEX DEFORMATION CALCULATIONS ──
+                            if (isChassisHit) {
+                                Vector3 rPos = { (float)btPos.x(), (float)btPos.y(), (float)btPos.z() };
+                                // Convert impact world map into local bounds of the car geometry
+                                Vector3 localHit = Vector3Transform(rPos, MatrixInvert(gCarBody.model.transform));
+                                float dmgRadius = 1.0f; // 1 meter impact area
+                                float crushStrength = (impulse - hitThreshold) * 0.0004f; 
+                                if (crushStrength > 0.4f) crushStrength = 0.4f;
+
+                                Vector3 cCenter = { (float)gCarBody.centroid.x(), (float)gCarBody.centroid.y(), (float)gCarBody.centroid.z() };
+
+                                for (size_t k = 0; k < gCageNodesCur.size(); k++) {
+                                    float dist = Vector3Distance(localHit, gCageNodesCur[k]);
+                                    if (dist < dmgRadius) {
+                                        float falloff = 1.0f - (dist / dmgRadius);
+                                        // Push vertex towards the logical core centroid of the car body
+                                        Vector3 pushDir = Vector3Normalize(Vector3Subtract(cCenter, gCageNodesOrig[k]));
+                                        Vector3 movement = Vector3Scale(pushDir, crushStrength * falloff);
+                                        gCageNodesCur[k] = Vector3Add(gCageNodesCur[k], movement);
+                                        
+                                        // Hard cap crumple deformation to limit tearing the model inside out
+                                        Vector3 totalDisp = Vector3Subtract(gCageNodesCur[k], gCageNodesOrig[k]);
+                                        float totalDist = Vector3Length(totalDisp);
+                                        if (totalDist > 0.65f) { // 65 cm maximum physical crush depth
+                                            gCageNodesCur[k] = Vector3Add(gCageNodesOrig[k], Vector3Scale(Vector3Normalize(totalDisp), 0.65f));
+                                        }
+                                        gCarDeformed = true;
+                                    }
+                                }
+                            }
+                            
                             // Audio Triggering Logic
                             if (GetTime() - lastImpactSoundTime > 0.15f) { // Debounce extremely fast consecutive contacts
                                 int sIdx = 0;
@@ -1455,6 +1566,33 @@ int main()
         // Sync
         for(int i=0;i<nObjs;i++) SyncTransform(*allObjs[i]);
         SyncTransform(gCarBody);   // car body welded to chassis — sync its visual too
+
+        // ── DEFORMATION MESH UPDATE ───────────────────────────────────────────
+        if (gCarDeformed) {
+            // Re-apply binding offsets and sync the visual car mesh
+            for (const auto& bind : gCarVisualBinds) {
+                Vector3 newPos = Vector3Add(gCageNodesCur[bind.cageNodeIdx], bind.offset);
+                int baseIdx = bind.vertIdx * 3;
+                gCarVisualModel.meshes[bind.meshIdx].vertices[baseIdx]   = newPos.x;
+                gCarVisualModel.meshes[bind.meshIdx].vertices[baseIdx+1] = newPos.y;
+                gCarVisualModel.meshes[bind.meshIdx].vertices[baseIdx+2] = newPos.z;
+            }
+            for (int mi = 0; mi < gCarVisualModel.meshCount; mi++) {
+                UpdateMeshBuffer(gCarVisualModel.meshes[mi], 0, gCarVisualModel.meshes[mi].vertices, gCarVisualModel.meshes[mi].vertexCount * 3 * sizeof(float), 0);
+            }
+            // Re-apply binding offsets and sync the debug wireframe cage overlay
+            for (const auto& bind : gCageVisualBinds) {
+                Vector3 newPos = Vector3Add(gCageNodesCur[bind.cageNodeIdx], bind.offset);
+                int baseIdx = bind.vertIdx * 3;
+                gCarBody.model.meshes[bind.meshIdx].vertices[baseIdx]   = newPos.x;
+                gCarBody.model.meshes[bind.meshIdx].vertices[baseIdx+1] = newPos.y;
+                gCarBody.model.meshes[bind.meshIdx].vertices[baseIdx+2] = newPos.z;
+            }
+            for (int mi = 0; mi < gCarBody.model.meshCount; mi++) {
+                UpdateMeshBuffer(gCarBody.model.meshes[mi], 0, gCarBody.model.meshes[mi].vertices, gCarBody.model.meshes[mi].vertexCount * 3 * sizeof(float), 0);
+            }
+            gCarDeformed = false;
+        }
 
         // ── RENDER ────────────────────────────────────────────────────────────
         BeginDrawing();
