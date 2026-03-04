@@ -132,7 +132,7 @@ static const float CAR_CRUSH_RESISTANCE = 0.0002f; // try 0.0001 - 0.0010
 //  DRIVE_TORQUE   = torque (Nm) applied to each rear wheel axle per physics step.
 //                   Higher → faster acceleration and more wheelspin at launch.
 //                   Lower  → sluggish acceleration, less wheelspin.
-static const float DRIVE_TORQUE    = 1000.0f;   // Nm  (try 200 – 1500)
+static const float DRIVE_TORQUE    = 1500.0f;   // Nm  (try 200 – 1500)
 
 //  MAX_WHEEL_SPIN = angular velocity cap on driven wheels (rad/s).
 //                   Prevents wheels from spinning infinitely fast.
@@ -971,6 +971,7 @@ int main()
         "Engine Sounds/Impact Sounds/Tire_si.mp3",
         "Engine Sounds/Impact Sounds/Tire_sii.mp3",
         "Engine Sounds/Impact Sounds/Tire_siii.mp3",
+        "Engine Sounds/Impact Sounds/Tire_s_burnout.mp3"
     };
     Sound screechSounds[4];
     for (int i=0; i<4; i++) {
