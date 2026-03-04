@@ -95,7 +95,7 @@ static const float CAR_PHYS_OFF_X =   0.0f;   // metres
 static const float CAR_PHYS_OFF_Y =   0.6f;   // metres  (try 0.3 – 0.8)
 
 //  CAR_PHYS_OFF_Z  = push car body FORWARD (+) or BACKWARD (-) of chassis centre.
-static const float CAR_PHYS_OFF_Z =  -0.1f;   // metres
+static const float CAR_PHYS_OFF_Z =  -0.05f;   // metres
 
 // =============================================================================
 //  ★ CENTER OF MASS OFFSET (Drift & Stability Tuning) ★
@@ -1074,7 +1074,7 @@ int main()
         float scroll=GetMouseWheelMove();
 
         // =====================================================================
-        //  ENGINE RPM CALCULATION + AUDIO UPDATE
+        //  x RPM CALCULATION + AUDIO UPDATE
         // =====================================================================
         if (IsKeyPressed(KEY_I)) showDamageVis = !showDamageVis;
         if (IsKeyPressed(KEY_O)) showCageVis = !showCageVis;
