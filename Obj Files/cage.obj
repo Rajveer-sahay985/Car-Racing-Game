@@ -1,6 +1,6 @@
 # Blender 5.0.1
 # www.blender.org
-mtllib car.mtl
+mtllib Cage.mtl
 o cage_2
 v -1.000000 0.172186 1.301325
 v -0.833942 1.088851 1.294150
