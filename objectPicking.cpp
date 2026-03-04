@@ -119,6 +119,11 @@ static const float CHASSIS_MASS    =  80.0f;   // kg  (try 30 – 150)
 //                   that loads the suspension springs and increases tire grip.
 static const float CAR_BODY_MASS   = 1500.0f;   // kg  (try 400 – 1000)
 //                   Total sprung mass per corner = (CHASSIS_MASS + CAR_BODY_MASS) / 4
+
+//  CAR_CRUSH_RESISTANCE = controls how "stiff" or "strong" the car metal feels
+//                   Higher → less deformation per impact (feels like solid steel)
+//                   Lower  → massive dents from small taps (feels like tin foil)
+static const float CAR_CRUSH_RESISTANCE = 0.0002f; // try 0.0001 - 0.0010
 // =============================================================================
 
 // =============================================================================
@@ -960,6 +965,22 @@ int main()
     Sound impactSounds[IMPACT_COUNT];
     for (int i=0; i<IMPACT_COUNT; i++) impactSounds[i] = LoadSound(IMPACT_FILES[i]);
     float lastImpactSoundTime = 0.0f;
+
+    // ── Screech Sounds ────────────────────────────────────────────────────────
+    const char* SCREECH_FILES[] = {
+        "Engine Sounds/Impact Sounds/Tire_si.mp3",
+        "Engine Sounds/Impact Sounds/Tire_sii.mp3",
+        "Engine Sounds/Impact Sounds/Tire_siii.mp3",
+    };
+    Sound screechSounds[4];
+    for (int i=0; i<4; i++) {
+        screechSounds[i] = LoadSound(SCREECH_FILES[i]);
+        SetSoundVolume(screechSounds[i], 0.6f);
+    }
+    bool wasScreeching = false;
+    float lastScreechTime = 0.0f;
+
+    // ── Engine ────────────────────────────────────────────────────────────────
     float currentRPM        = 1500.0f;
     float rawRPM            = 1500.0f;
     const float RPM_IDLE    = 1500.0f;
@@ -1455,6 +1476,42 @@ int main()
         // Physics
         gWorld->stepSimulation(dt,10,1.f/120.f);
 
+        // ── Tire Screech Audio Trigger ───────────────────────────────────────────
+        // We aggregate the slip logic from the previous Pacejka block loop.
+        bool isScreeching = false;
+        bool isBurnout = false;
+        
+        btTransform pacejkaT; gChassisBody->getMotionState()->getWorldTransform(pacejkaT);
+        btVector3 chassisFwd = pacejkaT.getBasis() * btVector3(0.f, 0.f, 1.f);
+        float vCarT    = (float)gChassisBody->getLinearVelocity().dot(chassisFwd);
+        float vCarAbsT = fabsf(vCarT);
+
+        for (int wi = 2; wi < 4; wi++) {
+            btRigidBody* wb   = gWheels[wi].body;
+            btVector3    axle = wb->getWorldTransform().getBasis() * btVector3(1.f, 0.f, 0.f);
+            float omega       = (float)wb->getAngularVelocity().dot(axle);
+            float vSpin       = fabsf(omega) * gWheels[wi].wheelRadius;
+
+            float denom = fmaxf(fmaxf(vCarAbsT, vSpin), 0.30f);
+            float slip  = fminf(fabsf(vSpin - vCarAbsT) / denom, 1.0f);
+
+            // Detect if Spacebar Handbrake is killing grip (drift) or high slip (burnout)
+            if ((brakeForce > 0.2f && vCarAbsT > 10.0f) || slip > 0.65f) {
+                isScreeching = true;
+                if (vCarAbsT < 3.0f && slip > 0.8f) isBurnout = true;
+            }
+        }
+
+        if (isScreeching) {
+            // Only play if a reasonable duration has elapsed to prevent spam overlapping
+            if (!wasScreeching || GetTime() - lastScreechTime > 1.2f) { // ~duration of mp3 clip
+                int soundIdx = isBurnout ? 3 : GetRandomValue(0, 2);
+                PlaySound(screechSounds[soundIdx]);
+                lastScreechTime = GetTime();
+            }
+        }
+        wasScreeching = isScreeching;
+
         // ── Damage detection from collision manifolds ─────────────────────────
         int numManifolds = gWorld->getDispatcher()->getNumManifolds();
         for (int i = 0; i < numManifolds; i++) {
@@ -1500,7 +1557,7 @@ int main()
                                 // Convert impact world map into local bounds of the car geometry
                                 Vector3 localHit = Vector3Transform(rPos, MatrixInvert(gCarBody.model.transform));
                                 float dmgRadius = 1.0f; // 1 meter impact area
-                                float crushStrength = (impulse - hitThreshold) * 0.0004f; 
+                                float crushStrength = (impulse - hitThreshold) * CAR_CRUSH_RESISTANCE; 
                                 if (crushStrength > 0.4f) crushStrength = 0.4f;
 
                                 Vector3 cCenter = { (float)gCarBody.centroid.x(), (float)gCarBody.centroid.y(), (float)gCarBody.centroid.z() };
@@ -1649,7 +1706,7 @@ int main()
                 // ── Draw invisible suspension as coloured spring-lines ───────
                 // Shows the suspension connections so users understand what's
                 // happening even though the chassis is invisible.
-                {
+                if (gChassisBody) {
                     btTransform bt; gChassisBody->getMotionState()->getWorldTransform(bt);
                     btVector3 cc=bt.getOrigin();
                     Vector3 chassisCentre={(float)cc.x(),(float)cc.y(),(float)cc.z()};
@@ -1846,8 +1903,8 @@ int main()
                     int baseY = 50;
                     DrawText("GAMEPAD: NONE DETECTED", baseX, baseY, 11, {255,100,100,200});
                 }
-                btTransform ct; gChassisBody->getMotionState()->getWorldTransform(ct);
-                btVector3 fwd = ct.getBasis() * btVector3(0.f,0.f,1.f);
+                btTransform camT; gChassisBody->getMotionState()->getWorldTransform(camT);
+                btVector3 fwd = camT.getBasis() * btVector3(0.f,0.f,1.f);
                 float vCar = fabsf((float)gChassisBody->getLinearVelocity().dot(fwd));
                 int yRow = 156;
                 DrawText("TIRE TELEMETRY", 10, yRow, 11, {160,255,160,200}); yRow+=14;
