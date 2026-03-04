@@ -779,6 +779,54 @@ static void ResetRig(const btVector3 wheelSpawns[4])
 }
 
 // =============================================================================
+//  LIGHTING SHADER (GLSL 330)
+// =============================================================================
+static const char* lightingVS = R"(
+#version 330
+in vec3 vertexPosition;
+in vec2 vertexTexCoord;
+in vec3 vertexNormal;
+in vec4 vertexColor;
+out vec3 fragPosition;
+out vec2 fragTexCoord;
+out vec3 fragNormal;
+out vec4 fragColor;
+uniform mat4 mvp;
+uniform mat4 matModel;
+void main()
+{
+    fragPosition = vec3(matModel * vec4(vertexPosition, 1.0));
+    fragTexCoord = vertexTexCoord;
+    mat3 normalMatrix = transpose(inverse(mat3(matModel)));
+    fragNormal = normalize(normalMatrix * vertexNormal);
+    fragColor = vertexColor;
+    gl_Position = mvp * vec4(vertexPosition, 1.0);
+}
+)";
+
+static const char* lightingFS = R"(
+#version 330
+in vec3 fragPosition;
+in vec2 fragTexCoord;
+in vec3 fragNormal;
+in vec4 fragColor;
+out vec4 finalColor;
+uniform sampler2D texture0;
+uniform vec4 colDiffuse;
+void main()
+{
+    vec3 lightDir = normalize(vec3(-1.0, 1.5, -1.0));
+    vec3 normal = normalize(fragNormal);
+    float diff = max(dot(normal, lightDir), 0.0);
+    vec3 ambient = vec3(0.53, 0.6, 0.65); // Sky light
+    vec3 diffuse = diff * vec3(1.0, 0.95, 0.9); // Sun light
+    vec4 texColor = texture(texture0, fragTexCoord);
+    vec3 finalRGB = texColor.rgb * colDiffuse.rgb * (ambient + diffuse);
+    finalColor = vec4(finalRGB, texColor.a * colDiffuse.a);
+}
+)";
+
+// =============================================================================
 //  MAIN
 // =============================================================================
 int main()
@@ -850,10 +898,10 @@ int main()
     //     RL (-TRACK, H, -BASE)    RR (+TRACK, H, -BASE)
     struct TireDef { const char* path; const char* label; btVector3 spawn; };
     TireDef td[4]={
-        {"Obj Files/wheel_fl.obj","FL TIRE 15kg",{-WHEEL_TRACK, WHEEL_HEIGHT,  WHEEL_BASE}},
-        {"Obj Files/wheel_fr.obj","FR TIRE 15kg",{ WHEEL_TRACK, WHEEL_HEIGHT,  WHEEL_BASE}},
-        {"Obj Files/wheel_rl.obj","RL TIRE 15kg",{-WHEEL_TRACK, WHEEL_HEIGHT, -WHEEL_BASE}},
-        {"Obj Files/wheel_rr.obj","RR TIRE 15kg",{ WHEEL_TRACK, WHEEL_HEIGHT, -WHEEL_BASE}},
+        {"Obj Files/wheel_fr.obj","FL TIRE 15kg",{-WHEEL_TRACK, WHEEL_HEIGHT,  WHEEL_BASE}},
+        {"Obj Files/wheel_fl.obj","FR TIRE 15kg",{ WHEEL_TRACK, WHEEL_HEIGHT,  WHEEL_BASE}},
+        {"Obj Files/wheel_rr.obj","RL TIRE 15kg",{-WHEEL_TRACK, WHEEL_HEIGHT, -WHEEL_BASE}},
+        {"Obj Files/wheel_rl.obj","RR TIRE 15kg",{ WHEEL_TRACK, WHEEL_HEIGHT, -WHEEL_BASE}},
     };
 
     btVector3 wheelSpawns[4];
@@ -861,7 +909,7 @@ int main()
         gWheels[i].mass=WHEEL_MASS; gWheels[i].friction=TIRE_GRIP_IDLE; gWheels[i].restitution=0.30f;
         gWheels[i].linDamp=0.12f; gWheels[i].angDamp=0.35f;
         gWheels[i].linDampHeld=0.20f; gWheels[i].angDampHeld=0.90f;
-        gWheels[i].baseColor={30,30,35,255};   // dark rubber
+        gWheels[i].baseColor={90,90,100,255};   // lighter rubber for shader visibility
         gWheels[i].label=td[i].label;
         if (!LoadPhysObj(gWheels[i], td[i].path, /*useWheelCylinder=*/true)){
             TraceLog(LOG_ERROR,"Missing %s",td[i].path); return 1;
@@ -966,6 +1014,17 @@ int main()
     Vector3     hoverVW={0,0,0};
     bool        showBBox=false;   // [B] toggles physics AABB wireframe debug overlay
     bool        showCOM =false;   // [V] toggles Center of Mass sphere
+
+    // ── Apply High-Performance Lighting Shader ────────────────────────────────
+    Shader lightingShader = LoadShaderFromMemory(lightingVS, lightingFS);
+    for (int i=0; i<nObjs; i++) {
+        for (int m=0; m<allObjs[i]->model.materialCount; m++) {
+            allObjs[i]->model.materials[m].shader = lightingShader;
+        }
+    }
+    for (int m=0; m<gCarBody.model.materialCount; m++) {
+        gCarBody.model.materials[m].shader = lightingShader;
+    }
 
     // ==========================================================================
     //  GAME LOOP
@@ -1294,8 +1353,6 @@ int main()
                         c=held?Color{255,180,60,255}:hov?Color{80,80,95,255}:obj.baseColor;
                     }
                     DrawModel(obj.model,{0,0,0},1.f,c);
-                    DrawModelWires(obj.model,{0,0,0},1.f,
-                        isConcrete?Color{60,55,50,90}:Color{55,55,60,90});
 
                     if (hov||held) {
                         Vector3 piv=held?Vector3{(float)pickPivot.x(),(float)pickPivot.y(),(float)pickPivot.z()}:Vector3{0,0,0};
@@ -1316,7 +1373,6 @@ int main()
                     Matrix savedT = gCarBody.model.transform;
                     gCarBody.model.transform = carLocal;
                     DrawModel(gCarBody.model,{0,0,0},1.f,WHITE);   // show texture
-                    DrawModelWires(gCarBody.model,{0,0,0},1.f,{40,50,60,100});
                     gCarBody.model.transform = savedT;
                 }
 
