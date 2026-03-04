@@ -1268,7 +1268,8 @@ int main()
                 brakeForce = fmaxf(brakeForce - BRAKE_RAMP_DOWN, 0.0f);
             }
             if (brakeForce > 0.01f) {
-                for (int wi = 0; wi < 4; wi++) {
+                // E-Brake Drift logic: Apply severe counter-torque ONLY to rear wheels
+                for (int wi = 2; wi < 4; wi++) {
                     btRigidBody* wb   = gWheels[wi].body;
                     btVector3    axle = wb->getWorldTransform().getBasis() * btVector3(1,0,0);
                     float currSpin    = (float)(wb->getAngularVelocity().dot(axle));
@@ -1315,7 +1316,15 @@ int main()
                     else if (slip < TIRE_SLIP_PEAK)   friction = TIRE_GRIP_PEAK;  // peak plateau
                     else                              { float t = (slip - TIRE_SLIP_PEAK) / (1.0f - TIRE_SLIP_PEAK);
                                                         friction = TIRE_GRIP_PEAK - t * (TIRE_GRIP_PEAK - TIRE_GRIP_SPIN); }  // drop
-                    friction = fmaxf(friction, TIRE_GRIP_SPIN);
+
+                    // ── High Speed Drift Kick ──
+                    // If moving over ~36 km/h and hitting the brake (SPACE), kill rear tire friction 
+                    // completely to let the inertia violently swing the rear end out.
+                    if (brakeForce > 0.2f && vCarAbs > 10.0f) {
+                        friction = 0.15f; 
+                    } else {
+                        friction = fmaxf(friction, TIRE_GRIP_SPIN);
+                    }
                 } else {
                     // FRONT wheels — not driven, rolling contact, near peak always
                     friction = TIRE_FRONT_GRIP;
