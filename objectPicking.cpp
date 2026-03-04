@@ -1403,10 +1403,10 @@ int main()
                         const btCollisionObject* hitObj = isAssemblyA ? obA : obB;
                         bool isChassisHit = (hitObj == gChassisBody || hitObj == gCarBody.body);
                         
-                        // Tires bear the 1500kg car weight constantly, generating ~60-80 impulse every physics frame 
-                        // just from resting gravity. We need a much higher threshold for tires so they only trigger
-                        // on actual hard landings or jumps, whereas the chassis touching anything is always a hit.
-                        float hitThreshold = isChassisHit ? 30.0f : 250.0f;
+                        // The 1500kg car resting on its tires or its roof generates ~200-245 impulse 
+                        // every physics frame just from gravity. We need a threshold above ~250 
+                        // so they only trigger on actual impacts or jumps, not resting weight.
+                        float hitThreshold = 250.0f;
                         
                         if (impulse > hitThreshold) { 
                             carDamage += impulse * 0.005f;
