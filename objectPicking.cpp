@@ -862,50 +862,47 @@ static void ResetRig(const btVector3 wheelSpawns[4])
 }
 
 // =============================================================================
-//  LIGHTING SHADER (GLSL 330)
+//  CEL / TOON SHADER  (ported from Car_Physics_Engine.cpp)
+//  4-band stepped lighting — clean stylised look instead of smooth shading.
 // =============================================================================
 static const char* lightingVS = R"(
 #version 330
 in vec3 vertexPosition;
-in vec2 vertexTexCoord;
 in vec3 vertexNormal;
+in vec2 vertexTexCoord;
 in vec4 vertexColor;
-out vec3 fragPosition;
-out vec2 fragTexCoord;
-out vec3 fragNormal;
-out vec4 fragColor;
 uniform mat4 mvp;
 uniform mat4 matModel;
+uniform mat4 matNormal;
+out vec3 fragNormal;
+out vec2 fragTexCoord;
 void main()
 {
-    fragPosition = vec3(matModel * vec4(vertexPosition, 1.0));
+    fragNormal   = normalize(vec3(matNormal * vec4(vertexNormal, 0.0)));
     fragTexCoord = vertexTexCoord;
-    mat3 normalMatrix = transpose(inverse(mat3(matModel)));
-    fragNormal = normalize(normalMatrix * vertexNormal);
-    fragColor = vertexColor;
-    gl_Position = mvp * vec4(vertexPosition, 1.0);
+    gl_Position  = mvp * vec4(vertexPosition, 1.0);
 }
 )";
 
 static const char* lightingFS = R"(
 #version 330
-in vec3 fragPosition;
-in vec2 fragTexCoord;
 in vec3 fragNormal;
-in vec4 fragColor;
-out vec4 finalColor;
+in vec2 fragTexCoord;
 uniform sampler2D texture0;
 uniform vec4 colDiffuse;
+out vec4 finalColor;
 void main()
 {
-    vec3 lightDir = normalize(vec3(-1.0, 1.5, -1.0));
-    vec3 normal = normalize(fragNormal);
-    float diff = max(dot(normal, lightDir), 0.0);
-    vec3 ambient = vec3(0.53, 0.6, 0.65); // Sky light
-    vec3 diffuse = diff * vec3(1.0, 0.95, 0.9); // Sun light
+    vec3 lightDir = normalize(vec3(0.4, 1.0, 0.3));
+    float NdotL = dot(normalize(fragNormal), lightDir);
+    float intensity;
+    if      (NdotL > 0.6) intensity = 1.0;
+    else if (NdotL > 0.3) intensity = 0.75;
+    else if (NdotL > 0.0) intensity = 0.5;
+    else                  intensity = 0.25;
     vec4 texColor = texture(texture0, fragTexCoord);
-    vec3 finalRGB = texColor.rgb * colDiffuse.rgb * (ambient + diffuse);
-    finalColor = vec4(finalRGB, texColor.a * colDiffuse.a);
+    vec4 base = texColor * colDiffuse;
+    finalColor = vec4(base.rgb * intensity, base.a);
 }
 )";
 
@@ -1138,8 +1135,11 @@ int main()
     bool        showBBox=false;   // [B] toggles physics AABB wireframe debug overlay
     bool        showCOM =false;   // [V] toggles Center of Mass sphere
 
-    // ── Apply High-Performance Lighting Shader ────────────────────────────────
+    // ── Apply Cel/Toon Shader ─────────────────────────────────────────────────────────────
     Shader lightingShader = LoadShaderFromMemory(lightingVS, lightingFS);
+    // Tell Raylib which uniform slot is the normal matrix so it uploads it automatically
+    lightingShader.locs[SHADER_LOC_MATRIX_MODEL]  = GetShaderLocation(lightingShader, "matModel");
+    lightingShader.locs[SHADER_LOC_MATRIX_NORMAL]  = GetShaderLocation(lightingShader, "matNormal");
     for (int i=0; i<nObjs; i++) {
         for (int m=0; m<allObjs[i]->model.materialCount; m++) {
             allObjs[i]->model.materials[m].shader = lightingShader;
@@ -1668,10 +1668,13 @@ int main()
                     bool isConcrete=(&obj==&gConcrete);
 
                     Color c;
-                    if (isConcrete){
-                        c=held?Color{255,160,80,255}:hov?Color{255,240,160,255}:obj.baseColor;
+                    if (isConcrete) {
+                        // Concrete: full texture when idle, warm tint when hovered/held
+                        c = held ? Color{255,160,80,255} : hov ? Color{255,240,160,255} : WHITE;
                     } else {
-                        c=held?Color{255,180,60,255}:hov?Color{80,80,95,255}:obj.baseColor;
+                        // Wheels: draw with WHITE so the tyre MTL colours show at full brightness
+                        // (same as Car_Physics_Engine.cpp). Only tint on interact.
+                        c = held ? Color{255,180,60,255} : hov ? Color{120,200,255,255} : WHITE;
                     }
                     DrawModel(obj.model,{0,0,0},1.f,c);
 
