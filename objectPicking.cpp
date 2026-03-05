@@ -971,7 +971,7 @@ int main()
         "Engine Sounds/Impact Sounds/Tire_si.mp3",
         "Engine Sounds/Impact Sounds/Tire_sii.mp3",
         "Engine Sounds/Impact Sounds/Tire_siii.mp3",
-        "Engine Sounds/Impact Sounds/Tire_s_burnout.mp3"
+        //"Engine Sounds/Impact Sounds/Tire_s_burnout.mp3"
     };
     Sound screechSounds[4];
     for (int i=0; i<4; i++) {
