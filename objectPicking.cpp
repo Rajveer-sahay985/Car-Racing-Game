@@ -123,8 +123,70 @@ static const float CAR_BODY_MASS   = 1500.0f;   // kg  (try 400 – 1000)
 //  CAR_CRUSH_RESISTANCE = controls how "stiff" or "strong" the car metal feels
 //                   Higher → less deformation per impact (feels like solid steel)
 //                   Lower  → massive dents from small taps (feels like tin foil)
-static const float CAR_CRUSH_RESISTANCE = 0.0002f; // try 0.0001 - 0.0010
+static const float CAR_CRUSH_RESISTANCE = 0.0002f; // try 0.0001 - 0.0010 
 // =============================================================================
+
+// =============================================================================
+//  ★ CAR PAINT SHADER — Blinn-Phong + Fresnel + Procedural Env Reflection ★
+//
+//  Gives the car body a real car-paint look: sun hotspot, edge glow, and
+//  dynamic sky/ground reflection that shifts as you orbit the camera.
+//  All GPU-side math — zero cubemap lookups, very fast.
+// =============================================================================
+
+//  CAR_SPECULAR_STRENGTH = intensity of the sun highlight (the bright hotspot).
+//                   0.0 = matte   |  0.5 = satin   |  1.0 = mirror-like
+static const float CAR_SPECULAR_STRENGTH = 0.70f;   // try 0.2 – 1.0
+
+//  CAR_SHININESS = sharpness of the specular hotspot.
+//                   32  = diffuse paint   |  64  = satin   |  256 = metallic
+static const float CAR_SHININESS        = 96.0f;    // try 32 – 512
+
+//  CAR_FRESNEL_STRENGTH = grazing-angle rim glow contribution.
+//                   0.0 = no rim  |  0.3 = natural  |  0.8 = dramatic
+static const float CAR_FRESNEL_STRENGTH  = 0.40f;   // try 0.0 – 0.8
+
+//  CAR_FRESNEL_POWER = edge sharpness of the Fresnel rim.
+//                   2.0 = broad  |  4.0 = sharp  |  8.0 = hairline
+static const float CAR_FRESNEL_POWER     = 4.0f;    // try 2.0 – 8.0
+
+//  CAR_AMBIENT_MIN = minimum brightness on fully shadowed faces.
+//                   0.08 = dark/dramatic  |  0.20 = soft fill
+static const float CAR_AMBIENT_MIN       = 0.15f;   // try 0.05 – 0.40
+
+//  CAR_REFLECT_STRENGTH = reflection intensity on the car body.
+//  Uses base + Fresnel formula: always shows some reflection at all angles,
+//  gets stronger at grazing edges (physically correct for painted metal).
+//                   0.10 = very subtle gloss
+//                   0.22 = natural waxed paint  (recommended)
+//                   0.40 = metallic / high-gloss
+//                   0.70 = near chrome
+static const float CAR_REFLECT_STRENGTH  = 0.22f;   // try 0.10 – 0.60
+
+//  REFL_CUBE_SIZE = pixel size of each cubemap face (width = height).
+//                   32  = very cheap, blurry but plausible
+//                   64  = good balance (recommended)
+//                   128 = sharper, still fast on M1
+static const int REFL_CUBE_SIZE    = 64;
+
+//  REFL_UPDATE_EVERY = how many frames between cubemap re-renders.
+//                   1 = every frame (live update, 6 extra draw calls)
+//                   2 = every other frame (imperceptible lag at 60fps)
+//                   4 = update at ~15Hz, very cheap
+static const int REFL_UPDATE_EVERY = 2;
+// =============================================================================
+
+// Face direction / up vectors for the 6 cubemap views (+X -X +Y -Y +Z -Z)
+static const Vector3 REFL_FACE_DIR[6] = {
+    { 1.f, 0.f, 0.f}, {-1.f, 0.f, 0.f},
+    { 0.f, 1.f, 0.f}, { 0.f,-1.f, 0.f},
+    { 0.f, 0.f, 1.f}, { 0.f, 0.f,-1.f}
+};
+static const Vector3 REFL_FACE_UP[6] = {
+    { 0.f,-1.f, 0.f}, { 0.f,-1.f, 0.f},
+    { 0.f, 0.f, 1.f}, { 0.f, 0.f,-1.f},
+    { 0.f,-1.f, 0.f}, { 0.f,-1.f, 0.f}
+};
 
 // =============================================================================
 //  ★ ENGINE & DRIVETRAIN ★
@@ -907,6 +969,117 @@ void main()
 )";
 
 // =============================================================================
+//  CAR PAINT SHADER — Blinn-Phong specular + Fresnel rim
+//  Applied ONLY to gCarVisualModel (car.obj).
+//  Reads uniforms uploaded each frame from the tuning constants above.
+// =============================================================================
+static const char* carPaintVS = R"(
+#version 330
+in vec3 vertexPosition;
+in vec3 vertexNormal;
+in vec2 vertexTexCoord;
+uniform mat4 mvp;
+uniform mat4 matModel;
+uniform mat4 matNormal;
+out vec3 fragWorldPos;
+out vec3 fragNormal;
+out vec2 fragTexCoord;
+void main()
+{
+    vec4 worldPos   = matModel * vec4(vertexPosition, 1.0);
+    fragWorldPos    = worldPos.xyz;
+    fragNormal      = normalize(vec3(matNormal * vec4(vertexNormal, 0.0)));
+    fragTexCoord    = vertexTexCoord;
+    gl_Position     = mvp * vec4(vertexPosition, 1.0);
+}
+)";
+
+static const char* carPaintFS = R"(
+#version 330
+in vec3 fragWorldPos;
+in vec3 fragNormal;
+in vec2 fragTexCoord;
+uniform sampler2D texture0;   // car paint texture (ALBEDO slot)
+// Six faces of the real-time env cubemap — bound via Raylib material map slots
+uniform sampler2D texture1;   // +X face
+uniform sampler2D texture2;   // -X face
+uniform sampler2D texture3;   // +Y face
+uniform sampler2D texture4;   // -Y face
+uniform sampler2D texture5;   // +Z face
+uniform sampler2D texture6;   // -Z face
+uniform vec4  colDiffuse;
+uniform vec3  uLightDir;
+uniform vec3  uViewPos;
+uniform float uSpecStrength;
+uniform float uShininess;
+uniform float uFresnelStrength;
+uniform float uFresnelPower;
+uniform float uAmbientMin;
+uniform float uReflectStrength;
+out vec4 finalColor;
+
+// Sample the real-time 6-face environment capture.
+// R = reflection vector in world space.
+vec3 SampleEnv(vec3 R) {
+    vec3 a = abs(R);
+    vec2 uv;
+    if (a.x >= a.y && a.x >= a.z) {
+        float s = 1.0 / a.x;
+        if (R.x > 0.0) { uv = vec2(-R.z*s, R.y*s)*0.5+0.5; return texture(texture1, vec2(uv.x,1.0-uv.y)).rgb; }
+        else            { uv = vec2( R.z*s, R.y*s)*0.5+0.5; return texture(texture2, vec2(uv.x,1.0-uv.y)).rgb; }
+    } else if (a.y >= a.x && a.y >= a.z) {
+        float s = 1.0 / a.y;
+        if (R.y > 0.0) { uv = vec2( R.x*s, R.z*s)*0.5+0.5; return texture(texture3, vec2(uv.x,1.0-uv.y)).rgb; }
+        else            { uv = vec2( R.x*s,-R.z*s)*0.5+0.5; return texture(texture4, vec2(uv.x,1.0-uv.y)).rgb; }
+    } else {
+        float s = 1.0 / a.z;
+        if (R.z > 0.0) { uv = vec2( R.x*s, R.y*s)*0.5+0.5; return texture(texture5, vec2(uv.x,1.0-uv.y)).rgb; }
+        else            { uv = vec2(-R.x*s, R.y*s)*0.5+0.5; return texture(texture6, vec2(uv.x,1.0-uv.y)).rgb; }
+    }
+}
+
+void main()
+{
+    vec3  N = normalize(fragNormal);
+    vec3  V = normalize(uViewPos - fragWorldPos);
+    vec3  L = uLightDir;
+    vec3  H = normalize(L + V);
+
+    float NdotL   = max(dot(N, L), 0.0);
+    float diffuse = mix(uAmbientMin, 1.0, NdotL);
+    float NdotH   = max(dot(N, H), 0.0);
+    float spec    = pow(NdotH, uShininess) * uSpecStrength;
+    float VdotN   = max(dot(V, N), 0.0);
+    float fresnel = pow(1.0 - VdotN, uFresnelPower);
+
+    vec3  R      = reflect(-V, N);
+    vec3  envCol = SampleEnv(R);
+
+    vec4 texColor = texture(texture0, fragTexCoord);
+    vec3 paintCol = texColor.rgb * colDiffuse.rgb;
+
+    // ── Physically-correct car paint compositing ─────────────────────────────
+    // Real car paint is a LAYERED material:
+    //   Layer 1 – base coat (the colour, diffuse lit)    → always present
+    //   Layer 2 – clear coat reflection (additive gloss) → stronger at edges
+    //
+    // reflAmount uses base(0.2) + Fresnel boost so the runway is ALWAYS visible
+    // in the reflection, not only at grazing edges.
+    //
+    float reflAmount = uReflectStrength * (0.20 + 0.80 * fresnel);
+    //                                     ^^^^ base  ^^^^ Fresnel edge boost
+    //  At  0 deg   (looking straight at panel): reflAmount = strength * 0.20
+    //  At 90 deg   (grazing edge):               reflAmount = strength * 1.00
+    vec3 base    = paintCol * diffuse;             // base coat — full paint colour
+    vec3 gloss   = envCol   * reflAmount;          // clear coat — additive on top
+    vec3 specCol = vec3(1.00, 0.97, 0.90) * spec;  // sun hotspot
+    vec3 rimCol  = envCol   * fresnel * uFresnelStrength * 0.4; // Fresnel rim
+
+    finalColor = vec4(base + gloss + specCol + rimCol, texColor.a * colDiffuse.a);
+}
+)";
+
+// =============================================================================
 //  MAIN
 // =============================================================================
 int main()
@@ -1135,22 +1308,60 @@ int main()
     bool        showBBox=false;   // [B] toggles physics AABB wireframe debug overlay
     bool        showCOM =false;   // [V] toggles Center of Mass sphere
 
-    // ── Apply Cel/Toon Shader ─────────────────────────────────────────────────────────────
+    // ── Cel/Toon Shader — wheels, concrete, cage ─────────────────────────────
     Shader lightingShader = LoadShaderFromMemory(lightingVS, lightingFS);
-    // Tell Raylib which uniform slot is the normal matrix so it uploads it automatically
     lightingShader.locs[SHADER_LOC_MATRIX_MODEL]  = GetShaderLocation(lightingShader, "matModel");
-    lightingShader.locs[SHADER_LOC_MATRIX_NORMAL]  = GetShaderLocation(lightingShader, "matNormal");
-    for (int i=0; i<nObjs; i++) {
-        for (int m=0; m<allObjs[i]->model.materialCount; m++) {
+    lightingShader.locs[SHADER_LOC_MATRIX_NORMAL] = GetShaderLocation(lightingShader, "matNormal");
+    for (int i=0; i<nObjs; i++)
+        for (int m=0; m<allObjs[i]->model.materialCount; m++)
             allObjs[i]->model.materials[m].shader = lightingShader;
-        }
-    }
-    for (int m=0; m<gCarBody.model.materialCount; m++) {
+    for (int m=0; m<gCarBody.model.materialCount; m++)
         gCarBody.model.materials[m].shader = lightingShader;
+
+    // ── Car Paint Shader — applied ONLY to gCarVisualModel (car.obj) ─────────
+    Shader carPaintShader = LoadShaderFromMemory(carPaintVS, carPaintFS);
+    carPaintShader.locs[SHADER_LOC_MATRIX_MODEL]  = GetShaderLocation(carPaintShader, "matModel");
+    carPaintShader.locs[SHADER_LOC_MATRIX_NORMAL] = GetShaderLocation(carPaintShader, "matNormal");
+    // Upload the static tuning constants once at startup
+    {
+        Vector3 lightDir = Vector3Normalize({0.4f, 1.0f, 0.3f}); // same sun as cel shader
+        SetShaderValue(carPaintShader, GetShaderLocation(carPaintShader, "uLightDir"),
+                       &lightDir, SHADER_UNIFORM_VEC3);
+        SetShaderValue(carPaintShader, GetShaderLocation(carPaintShader, "uSpecStrength"),
+                       &CAR_SPECULAR_STRENGTH, SHADER_UNIFORM_FLOAT);
+        SetShaderValue(carPaintShader, GetShaderLocation(carPaintShader, "uShininess"),
+                       &CAR_SHININESS, SHADER_UNIFORM_FLOAT);
+        SetShaderValue(carPaintShader, GetShaderLocation(carPaintShader, "uFresnelStrength"),
+                       &CAR_FRESNEL_STRENGTH, SHADER_UNIFORM_FLOAT);
+        SetShaderValue(carPaintShader, GetShaderLocation(carPaintShader, "uFresnelPower"),
+                       &CAR_FRESNEL_POWER, SHADER_UNIFORM_FLOAT);
+        SetShaderValue(carPaintShader, GetShaderLocation(carPaintShader, "uAmbientMin"),
+                       &CAR_AMBIENT_MIN, SHADER_UNIFORM_FLOAT);
+        SetShaderValue(carPaintShader, GetShaderLocation(carPaintShader, "uReflectStrength"),
+                       &CAR_REFLECT_STRENGTH, SHADER_UNIFORM_FLOAT);
     }
-    for (int m=0; m<gCarVisualModel.materialCount; m++) {
-        gCarVisualModel.materials[m].shader = lightingShader;
+    int carPaintViewPosLoc = GetShaderLocation(carPaintShader, "uViewPos"); // updated each frame
+    for (int m=0; m<gCarVisualModel.materialCount; m++)
+        gCarVisualModel.materials[m].shader = carPaintShader;
+
+    // ── Real-time cubemap: 6 × 64×64 render textures ─────────────────────────
+    // Raylib binds material maps as texture0…texture10 automatically via DrawModel.
+    // We park the 6 faces in slots METALNESS(1)…HEIGHT(6) so the carPaintFS
+    // receives them as uniform sampler2D texture1 … texture6.
+    RenderTexture2D cubeFaces[6];
+    for (int i = 0; i < 6; i++)
+        cubeFaces[i] = LoadRenderTexture(REFL_CUBE_SIZE, REFL_CUBE_SIZE);
+
+    // Assign face textures to the car visual model material maps (all materials)
+    for (int m = 0; m < gCarVisualModel.materialCount; m++) {
+        gCarVisualModel.materials[m].maps[MATERIAL_MAP_METALNESS].texture  = cubeFaces[0].texture;
+        gCarVisualModel.materials[m].maps[MATERIAL_MAP_NORMAL].texture     = cubeFaces[1].texture;
+        gCarVisualModel.materials[m].maps[MATERIAL_MAP_ROUGHNESS].texture  = cubeFaces[2].texture;
+        gCarVisualModel.materials[m].maps[MATERIAL_MAP_OCCLUSION].texture  = cubeFaces[3].texture;
+        gCarVisualModel.materials[m].maps[MATERIAL_MAP_EMISSION].texture   = cubeFaces[4].texture;
+        gCarVisualModel.materials[m].maps[MATERIAL_MAP_HEIGHT].texture     = cubeFaces[5].texture;
     }
+    static int reflFrame = 0; // incremented each frame to throttle cubemap updates
 
     // ==========================================================================
     //  DAMAGE SYSTEM STATE
@@ -1400,25 +1611,33 @@ int main()
             if (gSusp[0]) gSusp[0]->setServoTarget(4, steerAngle);
             if (gSusp[1]) gSusp[1]->setServoTarget(4, steerAngle);
 
-            // — Progressive braking —
-            const float BRAKE_RAMP_UP   = 0.18f;  // per frame rate of build-up
-            const float BRAKE_RAMP_DOWN = 0.12f;  // per frame rate of release
+            // — Hard Brake (SPACE = instant wheel lock, all 4 wheels) —————————
+            // Old approach: counter-torque ramp → jitter when spin reverses sign.
+            // New approach: zero the axle-spin component every frame + max angDamp.
+            // This gives 100% lock from frame 1, no ramp, no oscillation.
+            const float BRAKE_RAMP_DOWN = 0.12f;  // release rate (no longer used for lock-up)
             if (io.brake > 0.1f) {
-                brakeForce = fminf(brakeForce + BRAKE_RAMP_UP * io.brake, 1.0f);
-            } else {
-                brakeForce = fmaxf(brakeForce - BRAKE_RAMP_DOWN, 0.0f);
-            }
-            if (brakeForce > 0.01f) {
-                // E-Brake Drift logic: Apply severe counter-torque ONLY to rear wheels
-                for (int wi = 2; wi < 4; wi++) {
+                brakeForce = 1.0f;  // instant — no ramp needed for hard lock
+                for (int wi = 0; wi < 4; wi++) {    // ALL 4 wheels, not just rear
                     btRigidBody* wb   = gWheels[wi].body;
-                    btVector3    axle = wb->getWorldTransform().getBasis() * btVector3(1,0,0);
-                    float currSpin    = (float)(wb->getAngularVelocity().dot(axle));
-                    if (fabsf(currSpin) > 0.01f)
-                        wb->applyTorqueImpulse(axle * (-currSpin / fabsf(currSpin)) * (brakeForce * BRAKE_TORQUE * dt));
                     wb->activate(true);
+                    // Zero out the axle-spin component of angular velocity
+                    btVector3 axle   = wb->getWorldTransform().getBasis() * btVector3(1,0,0);
+                    btVector3 angVel = wb->getAngularVelocity();
+                    float spinComp   = (float)angVel.dot(axle);
+                    // Remove the spin component — keep any tiny cross-axis wobble
+                    wb->setAngularVelocity(angVel - axle * spinComp);
+                    // Max angular damping pins the wheel from spinning up again this frame
+                    wb->setDamping(wb->getLinearDamping(), 0.9999f);
                 }
                 gChassisBody->activate(true);
+            } else {
+                brakeForce = fmaxf(brakeForce - BRAKE_RAMP_DOWN, 0.0f);
+                // Restore normal wheel angular damping when brake released
+                if (brakeForce < 0.01f) {
+                    for (int wi = 0; wi < 4; wi++)
+                        gWheels[wi].body->setDamping(gWheels[wi].linDamp, gWheels[wi].angDamp);
+                }
             }
         }
 
@@ -1653,6 +1872,36 @@ int main()
         }
 
         // ── RENDER ────────────────────────────────────────────────────────────
+        // Update per-frame view position for the car paint shader (specular tracking)
+        SetShaderValue(carPaintShader, carPaintViewPosLoc, &cam.position, SHADER_UNIFORM_VEC3);
+
+        // ── Real-time cubemap: render scene to 6 faces every REFL_UPDATE_EVERY frames ──
+        if ((++reflFrame % REFL_UPDATE_EVERY) == 0) {
+            // Capture point = car body centre (slightly elevated)
+            btTransform rT; gCarBody.body->getMotionState()->getWorldTransform(rT);
+            btVector3 rO = rT.getOrigin();
+            Vector3 capPos = {(float)rO.x(), (float)rO.y() + 0.3f, (float)rO.z()};
+
+            Camera3D rcam;
+            rcam.position   = capPos;
+            rcam.fovy       = 90.0f;
+            rcam.projection = CAMERA_PERSPECTIVE;
+
+            for (int fi = 0; fi < 6; fi++) {
+                rcam.target = Vector3Add(capPos, REFL_FACE_DIR[fi]);
+                rcam.up     = REFL_FACE_UP[fi];
+                BeginTextureMode(cubeFaces[fi]);
+                    ClearBackground({100, 149, 210, 255}); // sky blue
+                    BeginMode3D(rcam);
+                        DrawWorldFloor();
+                        // Draw all physics objects (runway + wheels); skip the car body itself
+                        for (int i = 0; i < nObjs; i++)
+                            DrawModel(allObjs[i]->model, {0,0,0}, 1.0f, WHITE);
+                    EndMode3D();
+                EndTextureMode();
+            }
+        }
+
         BeginDrawing();
             DrawSkyAndFloor();
 
@@ -2031,6 +2280,9 @@ int main()
         UnloadSound(engSounds[i]);
     }
     CloseAudioDevice();
+    for (int i = 0; i < 6; i++) UnloadRenderTexture(cubeFaces[i]);
+    UnloadShader(lightingShader);
+    UnloadShader(carPaintShader);
     CloseWindow();
     return 0;
 }
